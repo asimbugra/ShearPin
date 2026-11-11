@@ -1,0 +1,23 @@
+{
+  "name": "shearpin",
+  "private": true,
+  "packageManager": "pnpm@12.18.0",
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild",
+      "secp256k1",
+      "sqlite3"
+    ]
+  },
+  "dependencies": {
+    "@near-js/crypto": "^2.5.1"
+  },
+  "devDependencies": {
+    "dotenv": "^18.0.10"
+  }
+}

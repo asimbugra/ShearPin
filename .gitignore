@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+coverage/
+*.log
+.env
+backend/shearpin.db*
+shearpin.db*
