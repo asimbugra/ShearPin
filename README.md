@@ -4,7 +4,7 @@
 
 > A shear pin is the mechanical safety device that snaps when torque exceeds the limit — the machine survives. ShearPin does the same for agent wallets: when a spend exceeds policy, the signature is refused. The agent survives; your funds survive.
 
-**Live on NEAR testnet:** `shearpin-dbg-8f3.testnet`  
+**Live on NEAR testnet:** `contract.shearpin-owner-1.testnet`  
 **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
 ---
