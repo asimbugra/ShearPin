@@ -58,14 +58,16 @@ The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The 
 
 1. **Frozen** — owner kill-switch active
 2. **Tripped** — pin snapped by previous breach
-3. **Day rollover** — reset `spent_today`, `requests_today` on new slot
+3. **Day rollover** — reset `spent_today`, `requests_today`, per-token counters on new slot
 4. **Cooldown** — minimum blocks between requests
 5. **Rate limit** — max requests per day
-6. **Chain allowlist** — `chainId` must be in `allowed_chain_ids` (EIP-155 mandatory; legacy 6-field txs rejected)
-7. **Calldata policy** — empty data = native transfer; non-empty must be an ERC-20 `transfer(address,uint256)` (selector `0xa9059cbb`), decoded on-chain
-8. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
-9. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
-10. **Daily cap** — cumulative spend cannot exceed `daily_limit` (snaps pin on breach)
+6. **Gas-price cap** — `gasPrice` must be ≤ `max_gas_price` (default 500 gwei); gas burn (`gasPrice × gasLimit`) is charged to the daily budget
+7. **Chain allowlist** — `chainId` must be in `allowed_chain_ids` (EIP-155 mandatory; legacy 6-field txs rejected)
+8. **Calldata policy** — empty data = native transfer; non-empty must be an ERC-20 `transfer(address,uint256)` (selector `0xa9059cbb`) with `value == 0`, decoded on-chain
+9. **Token allowlist** — ERC-20 `to` (token contract) must be in `allowed_tokens` with a per-token cap; token units are tracked in a **separate per-token daily counter**, never mixed with the wei budget
+10. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
+11. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
+12. **Daily cap** — cumulative spend + gas burn cannot exceed `daily_limit` (snaps pin on breach)
 
 If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The MPC network is **never called**. No signature can ever be produced for a denied request.
 
@@ -120,7 +122,7 @@ pnpm install
 
 # 2. Build the smart contract (WASM)
 cd contract
-cargo test                    # 50 unit tests, all pass
+cargo test                    # 55 unit tests, all pass
 cargo build --target wasm32-unknown-unknown --release
 # artifact: target/wasm32-unknown-unknown/release/shearpin_contract.wasm
 
@@ -164,7 +166,7 @@ node --env-file=../.env dist/demo.js   # allow → recipient deny+snap → tripp
 ## Repository Structure
 
 ```
-contract/          Rust — policy engine + Chain Signatures flow (50 unit tests)
+contract/          Rust — policy engine + Chain Signatures flow (55 unit tests)
 sdk/               TypeScript client SDK (@shearpin/sdk)
 backend/           Express REST API + SQLite ledger (audit trail)
 frontend/          React demo dashboard (breaker panel)
