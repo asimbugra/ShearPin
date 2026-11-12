@@ -21,36 +21,33 @@ Real incidents show the stakes: prompt-injected agents have been tricked into si
 
 ## How It Works
 
+**The whole pipeline in one picture** — an agent never signs; it asks. Two checkpoints stand between an intent and a signature: the SDK wrapper (off-chain, advisory) and the policy contract (on-chain, enforcing). Nothing reaches the MPC network unless *both* say yes.
+
+```mermaid
+flowchart TB
+    A["🤖 AI agent<br>(any LLM)"] -->|"intent:<br>pay X to recipient"| W["SDK wrapper<br>guardedSpend"]
+    W -->|"1. counterparty check<br>(off-chain signals + contract view)"| CK{"allow / warn / block?"}
+    CK -->|"block"| REF["🚫 refuse —<br>nothing is submitted"]
+    CK -->|"warn"| H("👤 human review")
+    H -->|"decline"| REF
+    H -->|"approve = vet:<br>autoAllowApproved adds the<br>recipient to the allowlist"| TX["2. submit RLP unsigned<br>EIP-155 tx"]
+    CK -->|"allow"| TX
+    TX --> GATES
+
+    subgraph GATES["ShearPin policy contract on NEAR — 13 fail-closed gates, one pass"]
+        G1["state: frozen / tripped / day rollover /<br>cooldown / rate limit"]
+        G2["tx validation parsed ON-CHAIN from RLP:<br>gas-price cap · chainId allowlist ·<br>ERC-20 decode · token allowlist"]
+        G3["counterparty: shared blocklist ·<br>recipient allowlist"]
+        G4["caps: per-tx ≤ max_tx ·<br>spent_today + gas burn ≤ daily_limit"]
+        G1 --> G2 --> G3 --> G4
+    end
+
+    GATES -->|"ANY gate fails:<br>revert SHEARPIN_* ·<br>pin snaps · state persisted"| X["🚫 no signature can exist —<br>the MPC network is never called"]
+    GATES -->|"ALL pass"| MPC["🔑 MPC network<br>v1.signer — NEAR Chain Signatures"]
+    MPC -->|"3. signature"| BC["broadcast to any EVM chain<br>in the policy's chainId allowlist"]
 ```
-┌─────────────┐    1. intent     ┌──────────────────────────┐
-│  AI Agent   │ ────────────────▶ │  ShearPin Policy         │
-│  (any LLM)  │   RLP unsigned   │  Contract (NEAR)         │
-└─────────────┘   EIP-155 tx     │                          │
-                                │  ✓ frozen / tripped      │
-                                │  ✓ day rollover          │
-                                │  ✓ cooldown elapsed      │
-                                │  ✓ rate / day not exceeded│
-                                │  ✓ chainId allowlist     │
-                                │  ✓ calldata: ERC-20 only │
-                                │  ✓ recipient allowlist   │
-                                │  ✓ amount ≤ max_tx       │
-                                │  ✓ spent_today ≤ daily   │
-                                │         │                │
-                                │  PASS   │ REJECT          │
-                                │         ▼                │
-                                │  SHEARPIN_* revert       │  ← fail-closed:
-                                └────┬─────────────────────┘    no signature, ever
-                                     │ 2. MPC sign request
-                                     ▼
-                       ┌────────────────────────┐
-                       │  v1.signer-prod.testnet │
-                       │  (NEAR Chain Signatures)│
-                       │  MPC network            │
-                       └───────────┬────────────┘
-                                   │ 3. signature (or nothing)
-                                   ▼
-                     any EVM chain (per-policy chainId allowlist)
-```
+
+The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The contract parses it **on-chain** and derives the amount, recipient, and chainId itself — the agent never claims an amount, so it cannot declare "1" while having a large transfer signed. Malformed RLP, unknown calldata, or a non-allowlisted chain/recipient fail closed.
 
 The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The contract parses it **on-chain** and derives the amount, recipient, and chainId itself — the agent never claims an amount, so it cannot declare "1" while having a large transfer signed. Malformed RLP, unknown calldata, or a non-allowlisted chain/recipient fail closed.
 
@@ -118,6 +115,19 @@ The agent gets a real address on any Chain-Signatures-supported chain. But the s
 
 ## Counterparty Check (allow / warn / block)
 
+Every payment decision passes through this decision tree — one shared blocklist, per-owner vetting, and a human in the loop exactly where the prompt wants them (warn → ask, block → refuse):
+
+```mermaid
+flowchart TD
+    S["💰 payment intent<br>to recipient R"] --> CK{"check_counterparty<br>policy, R"}
+    CK -->|"≥ 2 staked reports<br>AND R not owner-allowlisted"| B["🚫 BLOCK — wrapper refuses to sign.<br>Bypassing the wrapper doesn't help:<br>the on-chain gate denies again<br>SHEARPIN_COUNTERPARTY_BLOCKED · pin snaps"]
+    CK -->|"1 report · unvetted ·<br>or reported-but-allowlisted"| WA["⚠️ WARN — ask the human<br>onWarn reasons"]
+    CK -->|"allowlisted,<br>zero reports"| AL["✅ ALLOW"]
+    WA -->|"human declines"| R["refused — nothing submitted"]
+    WA -->|"human approves<br>autoAllowApproved"| VET["owner adds R to the<br>policy allowlist<br>vet-by-approval"] --> PAY
+    AL --> PAY["spend → 13 gates →<br>MPC signature"]
+```
+
 Before any payment the agent-side wrapper asks the contract about the receiver:
 
 ```
@@ -129,6 +139,18 @@ check_counterparty(policy_id, address) -> verdict + reasons
 - **allow** — allowlisted with zero reports.
 
 **Why allowlisted addresses only warn.** `report()` is permissionless by design — but that makes it a Sybil target: two free testnet accounts could hard-block your real supplier and snap the pin (a DoS). The defense is ownership: **an address the owner explicitly allowlisted can never be counterparty-blocked** — reports only warn, and the owner re-vets by removing the allowlist entry if the reports are credible. Everyone else's blocklist verdict is unchanged.
+
+How a report travels through the shared blocklist — and where the 0.01 NEAR stake bites:
+
+```mermaid
+flowchart LR
+    A1["🤖 any agent<br>(policy A's runtime)"] -->|"report addr, category, evidence<br>+ 0.01 NEAR stake (kept)"| BL[("📜 shared blocklist<br>on-chain, immutable,<br>one report per reporter")]
+    A2["🤖 any other agent<br>(policy B's runtime)"] -->|"report + stake"| BL
+    BL -->|"< 2 reports"| W1["⚠️ warn for every policy"]
+    BL -->|"≥ 2 evidence-backed reports"| Q{"is the recipient<br>owner-allowlisted?"}
+    Q -->|"no"| DENY["🚫 hard BLOCK — denied by every<br>policy that hasn't vetted the address<br>(SHEARPIN_COUNTERPARTY_BLOCKED)"]
+    Q -->|"yes —<br>Sybil-proof"| WV["⚠️ warn only — the owner re-vets<br>(remove from allowlist if credible)"]
+```
 
 **The shared blocklist.** Anyone can report a bad counterparty on-chain:
 
@@ -168,12 +190,26 @@ The agent NEAR account signs with a **function-call access key scoped to one con
 What the key cannot do: transfer NEAR, call any other contract, add/delete keys, or delete the account — **or attach deposits at all**. The NEAR protocol rejects a deposit on a function-call-key call (`DepositWithFunctionCall`), so the allowance pays gas only. ShearPin's agent submits its spend with `deposit: 0` (see `sdk/src/index.ts`); the **contract** pays the MPC forwarding deposit from its own balance.
 
 **Allowance caveats** (from the [NEAR access keys docs](https://docs.near.org/protocol/accounts-contracts/access-keys) — read them):
-
 - when the allowance runs out, **the agent locks itself out**. The owner must delete the key and re-add it with a fresh allowance. Provisioning with 2 NEAR makes this a non-event; provisioning with 50 would hide the problem.
 - because the **contract pays the MPC deposit**, monitor the *contract's* balance, not the agent's. The per-day rate limit (`rate_limit_per_day`) is the upper bound on that cost.
 - an account holding only function-call keys can't transfer NEAR or add keys — it is exactly as narrow as the list above says.
 
 Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
+
+**The trust model in one picture** — stealing the agent key buys a thief exactly one capability: asking. Stealing the owner key buys everything; that's why it never lives on the agent runtime:
+
+```mermaid
+flowchart LR
+    subgraph AGENT["agent account — sat1-agent… (safe to hand to an LLM)"]
+        K1["🔑 function-call key<br>receiver: ShearPin contract ONLY<br>methods: request_signature ONLY<br>deposit: impossible — protocol rejects it<br>allowance: 2 NEAR, gas only"]
+    end
+    subgraph OWNER["owner account — never on the agent runtime"]
+        K2["🔑 full key<br>freeze / reset_pin / allowlists<br>approve warns · report counterparties"]
+    end
+    K1 -->|"every request re-checked<br>against the 13 gates"| C[("policy contract<br>on NEAR")]
+    K2 -->|"owner writes"| C
+    C -->|"signature only on ALL-pass"| MPC["🔑 MPC network<br>chain signatures"]
+```
 
 ### Where the agent should run: NEAR AI Cloud + TEE attestation (recommended deployment — not part of this demo)
 
