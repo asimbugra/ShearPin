@@ -1,7 +1,7 @@
 //! unit tests — every policy rule, boundaries, fail-closed paths
 
 use crate::*;
-use crate::rlp::parse_unsigned_legacy_tx;
+use crate::rlp::{parse_unsigned_evm_tx, UnsignedEvmTx, ERC20_TRANSFER_SELECTOR};
 use near_sdk::test_utils::VMContextBuilder;
 use near_sdk::{testing_env, AccountId, VMContext};
 
@@ -30,16 +30,17 @@ fn make_policy(c: &mut Contract, id: &str, max_tx: u128, daily: u128) {
 
 /// the canonical test vendor address (also the default allowlist entry)
 const VENDOR: &str = "0xd4e56740f876afec8011e179a8b763074e6b5c8f";
+/// USDC-like token contract for ERC-20 tests
+const TOKEN: &str = "0xa0b86a33e74c7c5c1e2b8f1e3d4a5b6c7d8e9f00";
 
-/// build a canonical RLP-encoded unsigned legacy EVM tx
-/// nonce=1, gasPrice=20 gwei, gasLimit=21000, to=VENDOR, value=amount, data=""
-fn make_rlp_tx(amount: u128) -> Vec<u8> {
-    make_rlp_tx_to_addr(VENDOR, amount)
+/// build a canonical RLP-encoded unsigned EIP-155 EVM tx (9 fields)
+/// nonce=1, gasPrice=20 gwei, gasLimit=21000, to=VENDOR, value=amount, data="", chainId=11155111 (Sepolia)
+fn make_eip155_tx(amount: u128) -> Vec<u8> {
+    make_eip155_tx_to_addr(VENDOR, amount, 11155111)
 }
 
-/// same, but with an arbitrary recipient (hex string with 0x prefix)
-fn make_rlp_tx_to_addr(to_hex: &str, amount: u128) -> Vec<u8> {
-    // decode hex address to bytes
+/// same, but with arbitrary recipient and chainId
+fn make_eip155_tx_to_addr(to_hex: &str, amount: u128, chain_id: u64) -> Vec<u8> {
     let hex = to_hex.trim_start_matches("0x");
     let mut to_bytes = vec![];
     for i in (0..hex.len()).step_by(2) {
@@ -62,6 +63,22 @@ fn make_rlp_tx_to_addr(to_hex: &str, amount: u128) -> Vec<u8> {
         item
     };
 
+    // chain_id encoding
+    let chain_item: Vec<u8> = if chain_id == 0 {
+        vec![0x80]
+    } else {
+        let mut bytes = vec![];
+        let mut v = chain_id;
+        while v > 0 {
+            bytes.push((v & 0xff) as u8);
+            v >>= 8;
+        }
+        bytes.reverse();
+        let mut item = vec![0x80 + bytes.len() as u8];
+        item.extend(bytes);
+        item
+    };
+
     let mut inner: Vec<u8> = vec![];
     inner.push(0x01);                                     // nonce=1
     inner.extend([0x85, 0x04, 0xa8, 0x17, 0xc8, 0x00]);   // gasPrice=20e9
@@ -70,6 +87,9 @@ fn make_rlp_tx_to_addr(to_hex: &str, amount: u128) -> Vec<u8> {
     inner.extend(to_bytes);
     inner.extend(value_item);                             // value=amount
     inner.push(0x80);                                     // data=""
+    inner.extend(chain_item);                             // chainId
+    inner.push(0x80);                                     // 0 (EIP-155 r)
+    inner.push(0x80);                                     // 0 (EIP-155 s)
 
     let len = inner.len();
     let mut rlp = vec![];
@@ -90,11 +110,104 @@ fn make_rlp_tx_to_addr(to_hex: &str, amount: u128) -> Vec<u8> {
     rlp
 }
 
-/// policy with signer bob + vendor allowlist — the standard demo setup
+/// build an ERC-20 transfer tx (EIP-155 format)
+/// to = token contract, value=0, data=transfer(recipient, amount)
+fn make_erc20_tx(token_hex: &str, recipient_hex: &str, amount: u128, chain_id: u64) -> Vec<u8> {
+    let token = token_hex.trim_start_matches("0x");
+    let mut token_bytes = vec![];
+    for i in (0..token.len()).step_by(2) {
+        token_bytes.push(u8::from_str_radix(&token[i..i + 2], 16).unwrap());
+    }
+    assert_eq!(token_bytes.len(), 20);
+
+    // ERC-20 transfer calldata: selector(4) + to(32, right-aligned) + amount(32)
+    let recipient = recipient_hex.trim_start_matches("0x");
+    let mut calldata = ERC20_TRANSFER_SELECTOR.to_vec();
+    // to: 12 zeros + 20 bytes address
+    calldata.extend([0u8; 12]);
+    for i in (0..recipient.len()).step_by(2) {
+        calldata.push(u8::from_str_radix(&recipient[i..i + 2], 16).unwrap());
+    }
+    // amount: 32 bytes big-endian
+    let mut amt_bytes = [0u8; 32];
+    let mut v = amount;
+    for i in (0..32).rev() {
+        amt_bytes[i] = (v & 0xff) as u8;
+        v >>= 8;
+    }
+    calldata.extend(amt_bytes);
+
+    // chain_id encoding
+    let chain_item: Vec<u8> = if chain_id == 0 {
+        vec![0x80]
+    } else {
+        let mut bytes = vec![];
+        let mut v = chain_id;
+        while v > 0 {
+            bytes.push((v & 0xff) as u8);
+            v >>= 8;
+        }
+        bytes.reverse();
+        let mut item = vec![0x80 + bytes.len() as u8];
+        item.extend(bytes);
+        item
+    };
+
+    let mut inner: Vec<u8> = vec![];
+    inner.push(0x01);                                     // nonce=1
+    inner.extend([0x85, 0x04, 0xa8, 0x17, 0xc8, 0x00]);   // gasPrice=20e9
+    inner.extend([0x82, 0x52, 0x08]);                     // gasLimit=21000
+    inner.push(0x94);                                     // to: token contract
+    inner.extend(token_bytes);
+    inner.push(0x80);                                     // value=0
+    // data
+    if calldata.len() <= 55 {
+        inner.push(0x80 + calldata.len() as u8);
+    } else {
+        let mut lb = vec![];
+        let mut l = calldata.len();
+        while l > 0 { lb.insert(0, (l & 0xff) as u8); l >>= 8; }
+        inner.push(0xb7 + lb.len() as u8);
+        inner.extend(lb);
+    }
+    inner.extend(calldata);
+    inner.extend(chain_item);                             // chainId
+    inner.push(0x80);                                     // 0
+    inner.push(0x80);                                     // 0
+
+    let len = inner.len();
+    let mut rlp = vec![];
+    if len <= 55 {
+        rlp.push(0xc0 + len as u8);
+    } else {
+        let mut lb = vec![];
+        let mut l = len;
+        while l > 0 {
+            lb.push((l & 0xff) as u8);
+            l >>= 8;
+        }
+        lb.reverse();
+        rlp.push(0xf7 + lb.len() as u8);
+        rlp.extend(lb);
+    }
+    rlp.extend(inner);
+    rlp
+}
+
+/// policy with signer bob + vendor allowlist + sepolia chain — the standard demo setup
 fn setup_demo_policy(c: &mut Contract, id: &str, max_tx: u128, daily: u128) {
     make_policy(c, id, max_tx, daily);
     c.set_signer(id.into(), bob());
     c.set_allowed_recipients(id.into(), vec![VENDOR.into()]);
+    c.set_allowed_chain_ids(id.into(), vec![11155111]); // Sepolia
+}
+
+/// like setup_demo_policy but with a custom rate limit
+fn setup_demo_policy_rate(c: &mut Contract, id: &str, max_tx: u128, daily: u128, rate: u32) {
+    c.create_policy(id.into(), "sat-1".into(), U128(max_tx), U128(daily), 10, rate);
+    c.set_signer(id.into(), bob());
+    c.set_allowed_recipients(id.into(), vec![VENDOR.into()]);
+    c.set_allowed_chain_ids(id.into(), vec![11155111]);
 }
 
 /// request_signature that passes policy returns a Promise; one that
@@ -116,7 +229,7 @@ fn expect_allow(c: &mut Contract, id: &str, payload: Vec<u8>) {
 #[allow(dead_code)]
 fn expect_deny(c: &mut Contract, id: &str, payload: Vec<u8>) -> String {
     // deny paths: (a) revert panic (frozen/tripped/cooldown/rate/auth/rlp)
-    //             (b) persist + return (recipient/over_tx/over_daily — trip persists)
+    //             (b) persist + return (recipient/over_tx/over_daily/chain — trip persists)
     use std::panic;
     let prev = panic::take_hook();
     panic::set_hook(Box::new(|_| {}));
@@ -157,8 +270,9 @@ fn create_and_read_policy() {
     assert_eq!(v.daily_limit, 500);
     assert_eq!(v.status, "ok");
     assert_eq!(c.policy_len(), 1);
-    // fresh policy denies all recipients (fail-closed default)
+    // fresh policy denies all recipients and chains (fail-closed default)
     assert!(v.allowed_recipients.is_empty());
+    assert!(v.allowed_chain_ids.is_empty());
 }
 
 #[test]
@@ -187,7 +301,7 @@ fn missing_policy_fails_closed() {
         "ghost".into(),
         "eth/0".into(),
         "ecdsa".into(),
-        make_rlp_tx(1),
+        make_eip155_tx(1),
     );
 }
 
@@ -205,7 +319,7 @@ fn stranger_cannot_request() {
         "p1".into(),
         "eth/0".into(),
         "ecdsa".into(),
-        make_rlp_tx(10),
+        make_eip155_tx(10),
     );
 }
 
@@ -217,7 +331,7 @@ fn signer_can_request_after_registration() {
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
-    expect_allow(&mut c, "p1", make_rlp_tx(10));
+    expect_allow(&mut c, "p1", make_eip155_tx(10));
 }
 
 #[test]
@@ -229,7 +343,7 @@ fn over_tx_cap_snaps_pin() {
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
     // amount comes from the RLP value field: 101 > max_tx 100
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(101)), "SHEARPIN_OVER_TX");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(101)), "SHEARPIN_OVER_TX");
     assert_eq!(c.policy_status("p1".into()), "tripped");
 }
 
@@ -255,7 +369,7 @@ fn tripped_pin_denies_requests() {
     p.tripped = true;
     c.policies.insert("p1".to_string(), p.clone());
     let mut ctx = base_ctx(); ctx.block_index += 10_000; ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(1)), "SHEARPIN_TRIPPED");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(1)), "SHEARPIN_TRIPPED");
 }
 
 #[test]
@@ -266,18 +380,11 @@ fn over_daily_cap_snaps_pin() {
     setup_demo_policy_rate(&mut c, "p1", 100, 500, 10);
     for i in 0..5 {
         let mut ctx = base_ctx(); ctx.block_index += 100 * (i + 1); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-        expect_allow(&mut c, "p1", make_rlp_tx(100));
+        expect_allow(&mut c, "p1", make_eip155_tx(100));
     }
     let mut ctx = base_ctx(); ctx.block_index += 700; ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(1)), "SHEARPIN_OVER_DAILY");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(1)), "SHEARPIN_OVER_DAILY");
     assert_eq!(c.policy_status("p1".into()), "tripped");
-}
-
-/// like setup_demo_policy but with a custom rate limit
-fn setup_demo_policy_rate(c: &mut Contract, id: &str, max_tx: u128, daily: u128, rate: u32) {
-    c.create_policy(id.into(), "sat-1".into(), U128(max_tx), U128(daily), 10, rate);
-    c.set_signer(id.into(), bob());
-    c.set_allowed_recipients(id.into(), vec![VENDOR.into()]);
 }
 
 #[test]
@@ -286,8 +393,8 @@ fn cooldown_blocks_rapid_fire() {
     let mut c = fresh();
     setup_demo_policy(&mut c, "p1", 100, 500);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    expect_allow(&mut c, "p1", make_rlp_tx(10));
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(10)), "SHEARPIN_COOLDOWN");
+    expect_allow(&mut c, "p1", make_eip155_tx(10));
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(10)), "SHEARPIN_COOLDOWN");
 }
 
 #[test]
@@ -297,10 +404,10 @@ fn rate_cap_trips() {
     setup_demo_policy(&mut c, "p1", 100, 10_000);
     for i in 0..5 {
         let mut ctx = base_ctx(); ctx.block_index += 100 * (i + 1); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-        expect_allow(&mut c, "p1", make_rlp_tx(10));
+        expect_allow(&mut c, "p1", make_eip155_tx(10));
     }
     let mut ctx = base_ctx(); ctx.block_index += 700; ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(10)), "SHEARPIN_RATE");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(10)), "SHEARPIN_RATE");
 }
 
 #[test]
@@ -310,7 +417,7 @@ fn freeze_blocks_everything() {
     setup_demo_policy(&mut c, "p1", 100, 500);
     c.freeze("p1".into());
     let mut ctx = base_ctx(); ctx.block_index += 100; ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(1)), "SHEARPIN_FROZEN");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(1)), "SHEARPIN_FROZEN");
 }
 
 #[test]
@@ -354,7 +461,7 @@ fn day_rollover_resets_counters() {
     let mut c = fresh();
     setup_demo_policy(&mut c, "p1", 100, 500);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    expect_allow(&mut c, "p1", make_rlp_tx(100));
+    expect_allow(&mut c, "p1", make_eip155_tx(100));
     let v = c.get_policy("p1".into()).unwrap();
     assert_eq!(v.spent_today, 100);
 
@@ -362,7 +469,7 @@ fn day_rollover_resets_counters() {
     ctx.block_index += BLOCKS_PER_DAY + 100;
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
-    expect_allow(&mut c, "p1", make_rlp_tx(50));
+    expect_allow(&mut c, "p1", make_eip155_tx(50));
     let v = c.get_policy("p1".into()).unwrap();
     assert_eq!(v.spent_today, 50, "day rollover must reset spent_today");
     assert_eq!(v.requests_today, 1);
@@ -396,7 +503,7 @@ fn unknown_key_type_rejected() {
         "p1".into(),
         "eth/0".into(),
         "qr".into(),
-        make_rlp_tx(10),
+        make_eip155_tx(10),
     );
 }
 
@@ -408,8 +515,9 @@ fn empty_allowlist_denies_all() {
     let mut c = fresh();
     make_policy(&mut c, "p1", 100, 500); // no set_allowed_recipients
     c.set_signer("p1".into(), bob());
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx(10)), "SHEARPIN_RECIPIENT");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(10)), "SHEARPIN_RECIPIENT");
     assert_eq!(c.policy_status("p1".into()), "tripped", "allowlist deny must snap the pin");
 }
 
@@ -421,7 +529,7 @@ fn recipient_not_in_allowlist_denied() {
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     // attacker address not in the allowlist
     let attacker = "0x0000000000000000000000000000000000000001";
-    assert_eq!(expect_deny(&mut c, "p1", make_rlp_tx_to_addr(attacker, 10)), "SHEARPIN_RECIPIENT");
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx_to_addr(attacker, 10, 11155111)), "SHEARPIN_RECIPIENT");
 }
 
 #[test]
@@ -433,15 +541,18 @@ fn amount_comes_from_rlp_not_caller() {
     let mut c = fresh();
     setup_demo_policy(&mut c, "p1", 100, 500);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    let payload = make_rlp_tx(101); // value baked into the RLP
+    let payload = make_eip155_tx(101); // value baked into the RLP
     assert_eq!(expect_deny(&mut c, "p1", payload), "SHEARPIN_OVER_TX");
 }
 
 #[test]
 fn rlp_parse_extracts_correct_amount_and_recipient() {
-    let tx = parse_unsigned_legacy_tx(&make_rlp_tx(12345)).unwrap();
+    let tx = parse_unsigned_evm_tx(&make_eip155_tx(12345)).unwrap();
     assert_eq!(tx.value, 12345);
     assert_eq!(tx.to, VENDOR);
+    assert_eq!(tx.chain_id, Some(11155111));
+    assert!(tx.data.is_empty());
+    assert!(tx.erc20_to.is_none());
 }
 
 #[test]
@@ -485,9 +596,219 @@ fn too_many_recipients_rejected() {
 }
 
 #[test]
-fn deny_log_includes_recipient() {
-    // exercised through lib::deny — format check
-    let log = deny("p1", "test_reason", 42, "0xabcdef");
+fn set_allowed_chain_ids_normalizes_and_dedupes() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 100, 500);
+    let v = c.set_allowed_chain_ids("p1".into(), vec![11155111, 11155111, 1, 5]);
+    assert_eq!(v.allowed_chain_ids.len(), 3);
+    assert!(v.allowed_chain_ids.contains(&11155111));
+    assert!(v.allowed_chain_ids.contains(&1));
+    assert!(v.allowed_chain_ids.contains(&5));
+}
+
+#[test]
+#[should_panic(expected = "too many chain IDs")]
+fn too_many_chain_ids_rejected() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 100, 500);
+    let many: Vec<u64> = (0..17).collect();
+    c.set_allowed_chain_ids("p1".into(), many);
+}
+
+#[test]
+fn chain_not_in_allowlist_denied() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 100, 500); // only chain 11155111 allowed
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    // try mainnet chainId=1 (not in allowlist)
+    assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx_to_addr(VENDOR, 10, 1)), "SHEARPIN_CHAIN");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn legacy_tx_rejected() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 100, 500);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    // legacy 6-field tx (no chainId) - should be rejected
+    let legacy = make_rlp_tx_legacy(10);
+    assert_eq!(expect_deny(&mut c, "p1", legacy), "SHEARPIN_LEGACY_TX");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+// helper for legacy tx (6 fields)
+fn make_rlp_tx_legacy(amount: u128) -> Vec<u8> {
+    make_rlp_tx_to_addr_legacy(VENDOR, amount)
+}
+
+fn make_rlp_tx_to_addr_legacy(to_hex: &str, amount: u128) -> Vec<u8> {
+    let hex = to_hex.trim_start_matches("0x");
+    let mut to_bytes = vec![];
+    for i in (0..hex.len()).step_by(2) {
+        to_bytes.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+    }
+    assert_eq!(to_bytes.len(), 20);
+
+    let value_item: Vec<u8> = if amount == 0 {
+        vec![0x80]
+    } else {
+        let mut bytes = vec![];
+        let mut v = amount;
+        while v > 0 {
+            bytes.push((v & 0xff) as u8);
+            v >>= 8;
+        }
+        bytes.reverse();
+        let mut item = vec![0x80 + bytes.len() as u8];
+        item.extend(bytes);
+        item
+    };
+
+    let mut inner: Vec<u8> = vec![];
+    inner.push(0x01);
+    inner.extend([0x85, 0x04, 0xa8, 0x17, 0xc8, 0x00]);
+    inner.extend([0x82, 0x52, 0x08]);
+    inner.push(0x94);
+    inner.extend(to_bytes);
+    inner.extend(value_item);
+    inner.push(0x80);
+
+    let len = inner.len();
+    let mut rlp = vec![];
+    if len <= 55 {
+        rlp.push(0xc0 + len as u8);
+    } else {
+        let mut lb = vec![];
+        let mut l = len;
+        while l > 0 {
+            lb.push((l & 0xff) as u8);
+            l >>= 8;
+        }
+        lb.reverse();
+        rlp.push(0xf7 + lb.len() as u8);
+        rlp.extend(lb);
+    }
+    rlp.extend(inner);
+    rlp
+}
+
+// ============ ERC-20 transfer tests ============
+
+#[test]
+fn erc20_transfer_parsed_correctly() {
+    let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
+    let tx = parse_unsigned_evm_tx(&rlp).unwrap();
+    assert_eq!(tx.value, 0);
+    assert_eq!(tx.to, TOKEN);
+    assert_eq!(tx.chain_id, Some(11155111));
+    assert_eq!(tx.erc20_to, Some(VENDOR.to_string()));
+    assert_eq!(tx.erc20_amount, Some(1_000_000));
+}
+
+#[test]
+fn erc20_transfer_allowed_when_recipient_in_allowlist() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    // add both token contract AND recipient to allowlist
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000);
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
+    expect_allow(&mut c, "p1", rlp);
+}
+
+#[test]
+fn erc20_transfer_denied_when_recipient_not_in_allowlist() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000);
+    c.set_signer("p1".into(), bob());
+    // only token contract in allowlist, NOT the recipient
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
+    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_RECIPIENT");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn erc20_transfer_amount_checked_against_caps() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 500_000, 1_000_000); // max_tx = 500k
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    // amount 1M > max_tx 500k
+    let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
+    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_OVER_TX");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn unknown_calldata_rejected() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 100, 500);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    // tx with unknown selector (0xdeadbeef) in calldata
+    let rlp = make_unknown_calldata_tx(11155111);
+    // parse fails closed with UnknownCalldata -> panic SHEARPIN_RLP_ERROR
+    let reason = expect_deny(&mut c, "p1", rlp);
+    assert!(reason.starts_with("SHEARPIN_RLP_ERROR"), "got: {}", reason);
+}
+
+fn make_unknown_calldata_tx(chain_id: u64) -> Vec<u8> {
+    let mut inner: Vec<u8> = vec![];
+    inner.push(0x01);
+    inner.extend([0x85, 0x04, 0xa8, 0x17, 0xc8, 0x00]);
+    inner.extend([0x82, 0x52, 0x08]);
+    inner.push(0x94);
+    inner.extend([0xd4, 0xe5, 0x67, 0x40, 0xf8, 0x76, 0xaf, 0xec, 0x80, 0x11, 0xe1, 0x79, 0xa8, 0xb7, 0x63, 0x07, 0x4e, 0x6b, 0x5c, 0x8f]);
+    inner.push(0x80); // value=0
+    // unknown selector 0xdeadbeef + 64 bytes padding
+    inner.push(0xb8); // long string prefix
+    inner.push(44);   // length 44
+    inner.extend([0xde, 0xad, 0xbe, 0xef]);
+    inner.extend([0u8; 40]);
+    // chainId
+    let mut chain_item = vec![];
+    let mut v = chain_id;
+    while v > 0 { chain_item.insert(0, (v & 0xff) as u8); v >>= 8; }
+    inner.push(0x80 + chain_item.len() as u8);
+    inner.extend(chain_item);
+    inner.push(0x80); inner.push(0x80);
+
+    let len = inner.len();
+    let mut rlp = vec![];
+    if len <= 55 { rlp.push(0xc0 + len as u8); }
+    else {
+        let mut lb = vec![]; let mut l = len;
+        while l > 0 { lb.insert(0, (l & 0xff) as u8); l >>= 8; }
+        rlp.push(0xf7 + lb.len() as u8); rlp.extend(lb);
+    }
+    rlp.extend(inner);
+    rlp
+}
+
+#[test]
+fn deny_log_includes_chain_id() {
+    let log = deny("p1", "test_reason", 42, "0xabcdef", Some(11155111));
+    assert!(log.contains("\"chain_id\":11155111"));
     assert!(log.contains("\"recipient\":\"0xabcdef\""));
     assert!(log.contains("\"amount\":42"));
+}
+
+#[test]
+fn deny_log_includes_null_chain_id_for_legacy() {
+    let log = deny("p1", "test_reason", 42, "0xabcdef", None);
+    assert!(log.contains("\"chain_id\":null"));
 }

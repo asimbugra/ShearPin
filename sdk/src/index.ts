@@ -1,15 +1,23 @@
 /**
  * shearpin sdk — the agent only ever asks.
  *
- * flow: build RLP-encoded unsigned legacy EVM tx -> contract parses it on-chain
- * to derive amount + recipient -> contract checks policy -> if allowed, the
- * contract itself requests the mpc signature -> we relay the signed tx
+ * flow: build RLP-encoded unsigned EIP-155 EVM tx -> contract parses it on-chain
+ * to derive amount + recipient + chainId -> contract checks policy -> if allowed,
+ * the contract itself requests the mpc signature -> we relay the signed tx
  * to the destination chain. denials panic inside the contract with a
  * SHEARPIN_* reason and never reach the mpc network at all.
  *
  * CRITICAL SECURITY: the agent NEVER claims an amount. the contract parses
- * the RLP payload and extracts value (amount) and to (recipient) itself.
- * an agent cannot declare "1" while signing a 100 ETH transfer.
+ * the RLP payload and extracts value (amount), to (recipient), calldata
+ * (ERC-20 transfer decoded), and chainId itself.
+ *
+ * tx format: EIP-155 (9 fields) [nonce, gasPrice, gasLimit, to, value, data,
+ * chainId, 0, 0] — replay-protected; legacy 6-field txs are rejected by the
+ * contract.
+ *
+ * calldata policy: empty = native transfer. non-empty MUST be an ERC-20
+ * transfer (selector 0xa9059cbb); the contract decodes the real recipient
+ * + amount from calldata and applies the same policy gates.
  */
 import { JsonRpcProvider } from "@near-js/providers";
 import { KeyPairSigner } from "@near-js/signers";
@@ -31,15 +39,16 @@ export interface PolicyView {
   frozen: boolean;
   status: string;
   allowed_recipients: string[];
+  allowed_chain_ids: number[];
 }
 
-/** RLP-encoded unsigned legacy EVM transaction (agent submits this, contract parses it) */
+/** RLP-encoded unsigned EIP-155 EVM transaction (agent submits this, contract parses it) */
 export interface SpendRequest {
   policyId: string;
   /** sub-path under the policy namespace, e.g. "eth/0" */
   derivationPath: string;
   keyType: KeyType;
-  /** RLP-encoded unsigned legacy tx: [nonce, gasPrice, gasLimit, to, value, data] */
+  /** RLP-encoded unsigned EIP-155 tx: [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0] */
   payload: Uint8Array;
 }
 
@@ -125,11 +134,21 @@ export class ShearPinClient {
         transaction: { hash: string };
         transaction_outcome?: { outcome?: { logs?: string[] } };
         receipts_outcome?: { outcome?: { logs?: string[] } }[];
+        status?: { SuccessValue?: string | null };
       };
       const logs: string[] = [];
       logs.push(...(out.transaction_outcome?.outcome?.logs ?? []));
       for (const r of out.receipts_outcome ?? []) {
         logs.push(...(r.outcome?.logs ?? []));
+      }
+      // persist-deny paths SUCCEED and return a SHEARPIN_* string as value
+      const succ = out.status?.SuccessValue;
+      if (succ) {
+        let retVal = "";
+        try { retVal = Buffer.from(succ, "base64").toString("utf8"); } catch { /* not utf8 */ }
+        if (retVal.includes("SHEARPIN_")) {
+          return { verdict: "deny", reason: retVal.match(/SHEARPIN_[A-Z_]+/)?.[0] ?? retVal, logs };
+        }
       }
       return { verdict: "allow", nearTxHash: out.transaction.hash, logs };
     } catch (err) {
@@ -152,6 +171,8 @@ export class ShearPinClient {
           : reason === "frozen" ? "SHEARPIN_FROZEN"
           : reason === "cooldown" ? "SHEARPIN_COOLDOWN"
           : reason === "rate" ? "SHEARPIN_RATE"
+          : reason === "chain_not_allowed" ? "SHEARPIN_CHAIN"
+          : reason === "legacy_tx_rejected" ? "SHEARPIN_LEGACY_TX"
           : `SHEARPIN_${reason.toUpperCase()}`;
         return { verdict: "deny", reason: `${shearpin}: ${reason}`, logs };
       }
@@ -161,7 +182,7 @@ export class ShearPinClient {
 
   /** owner-only: set allowed recipients for a policy (fail-closed: empty = deny all) */
   async setAllowedRecipients(policyId: string, recipients: string[]): Promise<PolicyView> {
-    const out = await this.account.signAndSendTransaction({
+    await this.account.signAndSendTransaction({
       receiverId: this.cfg.contractId,
       actions: [
         najActions.functionCall(
@@ -171,15 +192,100 @@ export class ShearPinClient {
           0n
         ),
       ],
-    }) as unknown as { transaction: { hash: string }; transaction_outcome?: { outcome?: { logs?: string[] } } };
-    // re-fetch to get updated view
+    });
     return this.getPolicy(policyId);
   }
 
-  /** build an RLP-encoded unsigned legacy EVM transfer tx */
-  static buildLegacyTransferRlp(opts: {
+  /** owner-only: set allowed chain IDs (fail-closed: empty = deny all chains) */
+  async setAllowedChainIds(policyId: string, chainIds: number[]): Promise<PolicyView> {
+    await this.account.signAndSendTransaction({
+      receiverId: this.cfg.contractId,
+      actions: [
+        najActions.functionCall(
+          "set_allowed_chain_ids",
+          { policy_id: policyId, chain_ids: chainIds },
+          BigInt(100) * TGAS,
+          0n
+        ),
+      ],
+    });
+    return this.getPolicy(policyId);
+  }
+
+  // ------------------------------------------------------------------
+  // RLP encoding (EIP-155)
+  // ------------------------------------------------------------------
+
+  /** encode a bigint as canonical RLP integer item */
+  private static encodeInt(v: bigint): Uint8Array {
+    if (v === 0n) return new Uint8Array([0x80]);
+    const bytes: number[] = [];
+    let x = v;
+    while (x > 0n) {
+      bytes.unshift(Number(x & 0xffn));
+      x >>= 8n;
+    }
+    if (bytes[0] === 0) throw new Error("leading zero in int encoding");
+    if (bytes.length === 1 && bytes[0] <= 0x7f) return new Uint8Array(bytes);
+    const out = new Uint8Array(1 + bytes.length);
+    out[0] = 0x80 + bytes.length;
+    out.set(bytes, 1);
+    return out;
+  }
+
+  /** encode a byte string as RLP item (handles >55-byte long-form prefix) */
+  private static encodeBytes(data: Uint8Array): Uint8Array {
+    if (data.length === 0) return new Uint8Array([0x80]);
+    if (data.length === 1 && data[0] <= 0x7f) return data;
+    if (data.length <= 55) {
+      const out = new Uint8Array(1 + data.length);
+      out[0] = 0x80 + data.length;
+      out.set(data, 1);
+      return out;
+    }
+    // long-form: 0xb7 + len-of-len, then length bytes, then payload
+    const lenBytes: number[] = [];
+    let l = data.length;
+    while (l > 0) {
+      lenBytes.unshift(l & 0xff);
+      l >>= 8;
+    }
+    const out = new Uint8Array(1 + lenBytes.length + data.length);
+    out[0] = 0xb7 + lenBytes.length;
+    out.set(lenBytes, 1);
+    out.set(data, 1 + lenBytes.length);
+    return out;
+  }
+
+  private static encodeList(inner: Uint8Array): Uint8Array {
+    const len = inner.length;
+    if (len <= 55) {
+      const out = new Uint8Array(1 + len);
+      out[0] = 0xc0 + len;
+      out.set(inner, 1);
+      return out;
+    }
+    const lenBytes: number[] = [];
+    let l = len;
+    while (l > 0) {
+      lenBytes.unshift(l & 0xff);
+      l >>= 8;
+    }
+    const out = new Uint8Array(1 + lenBytes.length + len);
+    out[0] = 0xf7 + lenBytes.length;
+    out.set(lenBytes, 1);
+    out.set(inner, 1 + lenBytes.length);
+    return out;
+  }
+
+  /**
+   * build an RLP-encoded unsigned EIP-155 EVM tx (9 fields).
+   * native transfer: data empty. ERC-20: use buildErc20TransferRlp instead.
+   */
+  static buildEip155TransferRlp(opts: {
     to: string;
     value: bigint;
+    chainId: bigint;
     nonce?: bigint;
     gasPrice?: bigint;
     gasLimit?: bigint;
@@ -195,64 +301,83 @@ export class ShearPinClient {
     const gasLimit = opts.gasLimit ?? 21_000n;
     const data = opts.data ?? new Uint8Array(0);
 
-    const encodeInt = (v: bigint): Uint8Array => {
-      if (v === 0n) return new Uint8Array([0x80]);
-      const bytes: number[] = [];
-      let x = v;
-      while (x > 0n) {
-        bytes.unshift(Number(x & 0xffn));
-        x >>= 8n;
-      }
-      // canonical RLP: no leading zeros
-      if (bytes[0] === 0) throw new Error("leading zero in int encoding");
-      const prefix = bytes.length === 1 && bytes[0] <= 0x7f ? 0 : 0x80 + bytes.length;
-      const out = new Uint8Array(1 + bytes.length);
-      out[0] = prefix;
-      out.set(bytes, 1);
-      return out;
-    };
+    if (opts.chainId <= 0n) throw new Error("chainId required (EIP-155 replay protection)");
 
-    // RLP items: nonce, gasPrice, gasLimit, to, value, data
     const items: Uint8Array[] = [
-      encodeInt(nonce),
-      encodeInt(gasPrice),
-      encodeInt(gasLimit),
-      // to address: 20 bytes string
+      ShearPinClient.encodeInt(nonce),
+      ShearPinClient.encodeInt(gasPrice),
+      ShearPinClient.encodeInt(gasLimit),
       (() => {
         const out = new Uint8Array(1 + 20);
-        out[0] = 0x94; // 20-byte string prefix
+        out[0] = 0x94;
         out.set(toBytes, 1);
         return out;
       })(),
-      encodeInt(opts.value),
-      // data
-      data.length === 0 ? new Uint8Array([0x80]) : (() => {
-        const out = new Uint8Array(1 + data.length);
-        out[0] = 0x80 + data.length;
-        out.set(data, 1);
-        return out;
-      })(),
+      ShearPinClient.encodeInt(opts.value),
+      ShearPinClient.encodeBytes(data),
+      ShearPinClient.encodeInt(opts.chainId),
+      ShearPinClient.encodeInt(0n),
+      ShearPinClient.encodeInt(0n),
     ];
 
-    // concatenate all items
-    const inner = Buffer.concat(items);
+    return ShearPinClient.encodeList(Buffer.concat(items));
+  }
 
-    // outer list prefix
-    const len = inner.length;
-    let outerPrefix: Uint8Array;
-    if (len <= 55) {
-      outerPrefix = new Uint8Array([0xc0 + len]);
-    } else {
-      const lenBytes: number[] = [];
-      let l = len;
-      while (l > 0) {
-        lenBytes.unshift(l & 0xff);
-        l >>= 8;
-      }
-      outerPrefix = new Uint8Array([0xf7 + lenBytes.length, ...lenBytes]);
+  /** ERC-20 transfer calldata: selector + to(32) + amount(32) */
+  static encodeErc20TransferCalldata(to: string, amount: bigint): Uint8Array {
+    const toHex = to.startsWith("0x") ? to.slice(2) : to;
+    if (toHex.length !== 40) throw new Error("recipient must be 20-byte hex");
+    const out = new Uint8Array(68);
+    out.set([0xa9, 0x05, 0x9c, 0xbb], 0); // transfer(address,uint256)
+    out.set(Buffer.from(toHex, "hex"), 16); // right-aligned in 32-byte word
+    // amount: 32-byte big-endian word
+    const amt = new Uint8Array(32);
+    let v = amount;
+    for (let i = 31; i >= 0; i--) {
+      amt[i] = Number(v & 0xffn);
+      v >>= 8n;
     }
+    out.set(amt, 36);
+    return out;
+  }
 
-    return new Uint8Array(Buffer.concat([outerPrefix, inner]));
+  /**
+   * build an RLP-encoded unsigned EIP-155 ERC-20 transfer tx.
+   * the token contract is `to`, value=0, calldata transfers `amount` of
+   * token to `recipient`. the contract decodes recipient+amount from
+   * calldata and applies the recipient allowlist + caps to them.
+   */
+  static buildErc20TransferRlp(opts: {
+    token: string;
+    recipient: string;
+    amount: bigint;
+    chainId: bigint;
+    nonce?: bigint;
+    gasPrice?: bigint;
+    gasLimit?: bigint;
+  }): Uint8Array {
+    const calldata = ShearPinClient.encodeErc20TransferCalldata(opts.recipient, opts.amount);
+    return ShearPinClient.buildEip155TransferRlp({
+      to: opts.token,
+      value: 0n,
+      chainId: opts.chainId,
+      nonce: opts.nonce,
+      gasPrice: opts.gasPrice,
+      gasLimit: opts.gasLimit ?? 60_000n,
+      data: calldata,
+    });
+  }
+
+  /** @deprecated use buildEip155TransferRlp (EIP-155, replay-protected) */
+  static buildLegacyTransferRlp(opts: {
+    to: string;
+    value: bigint;
+    nonce?: bigint;
+    gasPrice?: bigint;
+    gasLimit?: bigint;
+    data?: Uint8Array;
+  }): Uint8Array {
+    return ShearPinClient.buildEip155TransferRlp({ ...opts, chainId: 11155111n });
   }
 }
 

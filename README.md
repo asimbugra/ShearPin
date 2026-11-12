@@ -4,7 +4,7 @@
 
 > A shear pin is the mechanical safety device that snaps when torque exceeds the limit — the machine survives. ShearPin does the same for agent wallets: when a spend exceeds policy, the signature is refused. The agent survives; your funds survive.
 
-**Live on NEAR testnet:** `shearpin-agent-1.testnet`  
+**Live on NEAR testnet:** `v3.shearpin-owner-1.testnet`  
 **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
 ---
@@ -24,45 +24,53 @@ Real incidents show the stakes: prompt-injected agents have been tricked into si
 ```
 ┌─────────────┐    1. intent     ┌──────────────────────────┐
 │  AI Agent   │ ────────────────▶ │  ShearPin Policy         │
-│  (any LLM)  │                   │  Contract (NEAR)         │
-└─────────────┘                   │                          │
-                                  │  ✓ frozen / tripped      │
-                                  │  ✓ day rollover          │
-                                  │  ✓ cooldown elapsed      │
-                                  │  ✓ rate / day not exceeded│
-                                  │  ✓ amount ≤ max_tx       │
-                                  │  ✓ spent_today ≤ daily   │
-                                  │         │                │
-                                  │  PASS   │ REJECT          │
-                                  │         ▼                │
-                                  │  SHEARPIN_* revert       │  ← fail-closed:
-                                  └────┬─────────────────────┘    no signature, ever
-                                       │ 2. MPC sign request
-                                       ▼
-                         ┌────────────────────────┐
-                         │  v1.signer-prod.testnet │
-                         │  (NEAR Chain Signatures)│
-                         │  MPC network            │
-                         └───────────┬────────────┘
-                                     │ 3. signature (or nothing)
+│  (any LLM)  │   RLP unsigned   │  Contract (NEAR)         │
+└─────────────┘   EIP-155 tx     │                          │
+                                │  ✓ frozen / tripped      │
+                                │  ✓ day rollover          │
+                                │  ✓ cooldown elapsed      │
+                                │  ✓ rate / day not exceeded│
+                                │  ✓ chainId allowlist     │
+                                │  ✓ calldata: ERC-20 only │
+                                │  ✓ recipient allowlist   │
+                                │  ✓ amount ≤ max_tx       │
+                                │  ✓ spent_today ≤ daily   │
+                                │         │                │
+                                │  PASS   │ REJECT          │
+                                │         ▼                │
+                                │  SHEARPIN_* revert       │  ← fail-closed:
+                                └────┬─────────────────────┘    no signature, ever
+                                     │ 2. MPC sign request
                                      ▼
-                         ETH / BTC / SOL / … 31+ chains
+                       ┌────────────────────────┐
+                       │  v1.signer-prod.testnet │
+                       │  (NEAR Chain Signatures)│
+                       │  MPC network            │
+                       └───────────┬────────────┘
+                                   │ 3. signature (or nothing)
+                                   ▼
+                     any EVM chain (per-policy chainId allowlist)
 ```
+
+The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The contract parses it **on-chain** and derives the amount, recipient, and chainId itself — the agent never claims an amount, so it cannot declare "1" while having a large transfer signed. Malformed RLP, unknown calldata, or a non-allowlisted chain/recipient fail closed.
 
 **Control flow (fixed order, fail-closed):**
 
 1. **Frozen** — owner kill-switch active
-2. **Tripped** — pin snapped by previous over-tx / over-daily breach
+2. **Tripped** — pin snapped by previous breach
 3. **Day rollover** — reset `spent_today`, `requests_today` on new slot
 4. **Cooldown** — minimum blocks between requests
 5. **Rate limit** — max requests per day
-6. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
-7. **Daily cap** — cumulative spend cannot exceed `daily_limit` (snaps pin on breach)
+6. **Chain allowlist** — `chainId` must be in `allowed_chain_ids` (EIP-155 mandatory; legacy 6-field txs rejected)
+7. **Calldata policy** — empty data = native transfer; non-empty must be an ERC-20 `transfer(address,uint256)` (selector `0xa9059cbb`), decoded on-chain
+8. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
+9. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
+10. **Daily cap** — cumulative spend cannot exceed `daily_limit` (snaps pin on breach)
 
 If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The MPC network is **never called**. No signature can ever be produced for a denied request.
 
 **Pin mechanism:**
-- Per-tx or daily breach → `tripped = true` (the pin snaps)
+- Per-tx, daily, recipient, or chain breach → `tripped = true` (the pin snaps)
 - Owner calls `freeze()` → `frozen = true` (manual kill-switch, same effect)
 - Owner calls `reset_pin()` → clears `tripped`, re-arms cooldown
 - Owner calls `unfreeze()` → clears `frozen`
@@ -71,15 +79,30 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 
 ---
 
+## Threat Model
+
+| Attack | How it's stopped |
+|---|---|
+| **Amount spoofing** (declare 1, sign 100 ETH) | Amount is parsed on-chain from the RLP `value` field — the agent never claims an amount |
+| **Calldata abuse** (allowlisted contract + `transfer(attacker, all)`) | Calldata must be ERC-20 `transfer`; real recipient + amount are decoded from calldata and run through the same allowlist + caps. Unknown selectors are rejected |
+| **Cross-chain replay** (same sig valid everywhere) | EIP-155 `chainId` is mandatory and checked against `allowed_chain_ids`; legacy (pre-EIP-155) txs are rejected |
+| **Unauthorized recipient** (attacker address) | Recipient allowlist, fail-closed: empty list denies all |
+| **Compromised agent key** (stolen agent NEAR account) | The agent account can only reach `request_signature` — policy gates + caps still apply; `freeze()` stops everything in one write |
+| **Rapid-fire drain** (many small txs) | Rate limit per day + cooldown blocks between requests |
+| **Buggy agent overspending** | Per-tx cap + daily cap snap the pin; owner resets deliberately |
+
+---
+
 ## Differentiation
 
 | | Existing agent vaults | **ShearPin** |
 |---|---|---|
-| Chain coverage | NEAR-only (access keys) | **31+ chains** via Chain Signatures |
+| Chain coverage | NEAR-only (access keys) | Any EVM chain via Chain Signatures (per-policy `allowed_chain_ids`) |
 | Enforcement point | Off-chain relay / server | **On-chain policy contract — before the signature exists** |
+| Amount validation | Agent-claimed / relay-checked | **Parsed on-chain from the RLP payload** |
+| Calldata validation | None / relay heuristics | **ERC-20 decode + recipient allowlist, on-chain** |
 | Kill switch | Re-key dance / revoke | **One transaction: `freeze()`** |
 | Trust model | Relay availability / custody | **Contract state, verifiable by anyone** |
-| Bypass risk | Relay compromise = key compromise | **Impossible — MPC request originates from contract only** |
 
 The agent gets a real address on any Chain-Signatures-supported chain. But the signing authority sits behind **one NEAR policy contract**: `one write (freeze), every chain off`.
 
@@ -95,7 +118,7 @@ pnpm install
 
 # 2. Build the smart contract (WASM)
 cd contract
-cargo test                    # 20 unit tests, all pass
+cargo test                    # 50 unit tests, all pass
 cargo build --target wasm32-unknown-unknown --release
 # artifact: target/wasm32-unknown-unknown/release/shearpin_contract.wasm
 
@@ -109,7 +132,8 @@ pnpm build
 node --env-file=../.env dist/deploy.js   # deploys wasm + calls new()
 
 # 5. Bootstrap a policy and seed the backend
-node --env-file=../.env dist/setup.js    # creates policy "sat1", sets signer
+node --env-file=../.env dist/setup.js    # creates policy "sat1", sets signer,
+                                         # sets allowlist + allowed chain IDs
 
 # 6. Start the backend indexer + API
 cd ../backend
@@ -121,25 +145,24 @@ cd ../frontend
 pnpm build
 pnpm dev                             # Vite dev server, proxy to backend
 
-# 8. Run the live 3-scene demo against testnet
+# 8. Run the live 4-scene demo against testnet
 cd ../agent-sim
-node --env-file=../.env dist/demo.js   # allow → over-tx deny → tripped deny
-#    or the interactive variant with dashboard feed:
-node --env-file=../.env demo-live2.mjs [policy_id]   # allow → pin SNAPS (persisted) → owner reset → allow
+node --env-file=../.env dist/demo.js   # allow → recipient deny+snap → tripped → chain deny
 ```
 
 > The demo asserts every step: the in-policy spend gets an MPC `signature_ok`
-> event, the over-limit request is denied **before any signature is requested**
+> event, the injected request is denied **before any signature is requested**
 > (no `sign:` log in that receipt), the pin stays tripped on-chain until the
-> owner calls `reset_pin`, and every outcome is fed to the backend ledger so
-> the dashboard shows the real tx hashes.
+> owner calls `reset_pin`, a mainnet-chainId tx is denied by the chain
+> allowlist, and every outcome is fed to the backend ledger so the dashboard
+> shows the real tx hashes.
 
 ---
 
 ## Repository Structure
 
 ```
-contract/          Rust — policy engine + Chain Signatures flow (20 unit tests)
+contract/          Rust — policy engine + Chain Signatures flow (50 unit tests)
 sdk/               TypeScript client SDK (@shearpin/sdk)
 backend/           Express REST API + SQLite ledger (audit trail)
 frontend/          React demo dashboard (breaker panel)
@@ -151,7 +174,7 @@ scripts/gen-keys.js  One-time keypair generator for testnet accounts
 
 ## Measured Performance (live testnet)
 
-Measured on `shearpin-agent-1.testnet` (NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`.
+Measured on `v3.shearpin-owner-1.testnet` (NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`.
 
 | Path | What happens | Latency | Gas |
 |---|---|---|---|
@@ -165,8 +188,8 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 ## Limitations (Honest)
 
 - **Testnet only** — contract deployed to `v1.signer-prod.testnet`, not mainnet `v1.signer`
-- **2 chains demonstrated** — NEAR (native) + Sepolia (EVM via MPC); 31+ supported by Chain Signatures but not exercised
-- **Transfer-only demo** — payloads are dummy EVM transfer hashes; arbitrary calldata not shown
+- **EVM-only tx parsing** — the on-chain RLP decoder handles EIP-155 EVM txs; non-EVM chains via Chain Signatures would need their own payload decoders
+- **ERC-20 `transfer` only** — `transferFrom`, swaps, and other selectors are rejected fail-closed (adding selectors is a small, contained change)
 - **Not audited** — code is hackathon-grade, no formal verification or third-party audit
 - **Single policy per agent** — multi-policy orchestration not implemented
 - **Owner is single NEAR account** — no multisig / DAO governance for freeze/reset

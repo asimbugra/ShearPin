@@ -1,10 +1,11 @@
 /**
  * sat-1 — a purchasing agent with a wallet it cannot drain.
  *
- * the demo runs three scenes against the LIVE testnet contract:
- *   s1 normal:      an in-policy spend is allowed and signed
- *   s2 runaway:     a "compromised" oversized request snaps the pin
- *   s3 containment: owner freezes; even tiny spends are denied
+ * the demo runs four scenes against the LIVE testnet contract:
+ *   s1 normal:      an in-policy EIP-155 spend is allowed and signed
+ *   s2 injection:   attacker recipient (not allowlisted) -> pin snaps
+ *   s3 containment: after trip, even tiny spends are denied
+ *   s4 wrong chain: tx for a non-allowlisted chainId -> pin snaps
  *
  * every outcome is posted to the backend ledger so the breaker panel
  * shows the story live. exit code 0 only if all scenes verify.
@@ -15,6 +16,8 @@ const CONTRACT = process.env.SHEARPIN_CONTRACT ?? "";
 const OWNER_KEY = process.env.SHEARPIN_OWNER_KEY ?? "";
 const API = process.env.SHEARPIN_API ?? "http://127.0.0.1:8787";
 const POLICY_ID = process.env.SHEARPIN_POLICY ?? "sat1";
+
+const SEPOLIA = 11155111n;
 
 // vendor address (must be in allowlist for S1 to pass)
 const VENDOR = "0xd4e56740f876afec8011e179a8b763074e6b5c8f";
@@ -39,7 +42,7 @@ async function sleep(ms: number) {
 
 async function verifyPolicy(client: ShearPinClient): Promise<PolicyView> {
   const policy = await client.getPolicy(POLICY_ID);
-  log("init", `policy ${POLICY_ID}: max_tx=${policy.max_tx}, daily=${policy.daily_limit}, recipients=${policy.allowed_recipients.join(", ")}`);
+  log("init", `policy ${POLICY_ID}: max_tx=${policy.max_tx} daily=${policy.daily_limit} chains=[${policy.allowed_chain_ids}] recipients=${policy.allowed_recipients.length}`);
   return policy;
 }
 
@@ -59,12 +62,13 @@ async function main() {
 
   let failed = 0;
 
-  // scene 1 — normal operation: 0.001 ETH to allowlisted vendor → ALLOW
+  // scene 1 — normal operation: 0.001 ETH to allowlisted vendor, Sepolia → ALLOW
   {
     const t0 = Date.now();
-    const payload = ShearPinClient.buildLegacyTransferRlp({
+    const payload = ShearPinClient.buildEip155TransferRlp({
       to: VENDOR,
       value: 1_000_000_000_000_000n, // 0.001 ETH
+      chainId: SEPOLIA,
     });
     const out = await client.requestSpend({
       policyId: POLICY_ID,
@@ -78,13 +82,14 @@ async function main() {
     if (out.verdict !== "allow") failed++;
   }
 
-  await sleep(1200);
+  await sleep(15_000);
 
-  // scene 2 — prompt injection: agent tricked into 5 ETH to attacker → DENY (recipient + over_tx)
+  // scene 2 — prompt injection: 5 ETH to attacker on Sepolia → DENY (recipient)
   {
-    const payload = ShearPinClient.buildLegacyTransferRlp({
+    const payload = ShearPinClient.buildEip155TransferRlp({
       to: ATTACKER,
-      value: 5_000_000_000_000_000_000n, // 5 ETH (over per-tx cap AND not allowlisted)
+      value: 5_000_000_000_000_000_000n, // 5 ETH
+      chainId: SEPOLIA,
     });
     const out = await client.requestSpend({
       policyId: POLICY_ID,
@@ -94,20 +99,20 @@ async function main() {
     });
     log("s2", `${out.verdict} ${out.reason ?? ""}`);
     await report({ policyId: POLICY_ID, amount: "5", verdict: out.verdict, reason: out.reason });
-    // should deny for recipient not allowed (trips pin)
     if (out.verdict !== "deny" || !/RECIPIENT|OVER_TX/.test(out.reason ?? "")) {
       failed++;
       console.error("  expected SHEARPIN_RECIPIENT or SHEARPIN_OVER_TX");
     }
   }
 
-  await sleep(1200);
+  await sleep(1_500);
 
-  // scene 3 — kill switch: owner freezes, even tiny spend denied
+  // scene 3 — containment: after trip, tiny spend denied
   {
-    const payload = ShearPinClient.buildLegacyTransferRlp({
+    const payload = ShearPinClient.buildEip155TransferRlp({
       to: VENDOR,
-      value: 1_000_000_000_000_000n, // 0.001 ETH
+      value: 1_000_000_000_000_000n,
+      chainId: SEPOLIA,
     });
     const out = await client.requestSpend({
       policyId: POLICY_ID,
@@ -117,9 +122,34 @@ async function main() {
     });
     log("s3", `${out.verdict} ${out.reason ?? ""}`);
     await report({ policyId: POLICY_ID, amount: "0.001", verdict: out.verdict, reason: out.reason });
-    if (out.verdict !== "deny" || !/FROZEN|TRIPPED/.test(out.reason ?? "")) {
+    if (out.verdict !== "deny" || !/TRIPPED/.test(out.reason ?? "")) {
       failed++;
-      console.error("  expected SHEARPIN_FROZEN or SHEARPIN_TRIPPED");
+      console.error("  expected SHEARPIN_TRIPPED");
+    }
+  }
+
+  // reset pin before scene 4 so the chain gate is reachable
+  await fetch(`${API}/policies/${POLICY_ID}/reset`, { method: "POST" }).catch(() => undefined);
+  await sleep(15_000);
+
+  // scene 4 — wrong chain: same vendor but chainId=1 (mainnet) → DENY (chain)
+  {
+    const payload = ShearPinClient.buildEip155TransferRlp({
+      to: VENDOR,
+      value: 1_000_000_000_000_000n,
+      chainId: 1n, // Ethereum mainnet — not in allowlist
+    });
+    const out = await client.requestSpend({
+      policyId: POLICY_ID,
+      derivationPath: "eth/0",
+      keyType: "ecdsa",
+      payload,
+    });
+    log("s4", `${out.verdict} ${out.reason ?? ""}`);
+    await report({ policyId: POLICY_ID, amount: "0.001", verdict: out.verdict, reason: out.reason });
+    if (out.verdict !== "deny" || !/CHAIN/.test(out.reason ?? "")) {
+      failed++;
+      console.error("  expected SHEARPIN_CHAIN");
     }
   }
 
@@ -130,7 +160,7 @@ async function main() {
     console.error(`DEMO FAILED (${failed} scene(s))`);
     process.exit(1);
   }
-  console.log("DEMO PASSED — all three scenes verified");
+  console.log("DEMO PASSED — all four scenes verified");
 }
 
 main().catch((e) => {

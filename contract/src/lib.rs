@@ -11,9 +11,17 @@
 //! recipient itself. the agent never claims an amount, so it cannot
 //! declare "1" while having a large transfer signed.
 //!
+//! supported tx formats:
+//!   - legacy (6 fields): [nonce, gasPrice, gasLimit, to, value, data]
+//!   - EIP-155 (9 fields): [nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]
+//!
+//! calldata policy: empty data = native transfer. non-empty data MUST be a known
+//! ERC-20 transfer (selector 0xa9059cbb) to an allowlisted address. anything
+//! else is rejected fail-closed.
+//!
 //! check order is fixed and fail-closed:
-//!   frozen -> day rollover -> cooldown -> rate -> recipient allowlist
-//!   -> per-tx cap -> daily cap
+//!   frozen -> day rollover -> cooldown -> rate -> chain allowlist
+//!   -> recipient allowlist -> per-tx cap -> daily cap
 
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::store::IterableMap;
@@ -25,7 +33,7 @@ use near_sdk::{
 };
 
 mod rlp;
-use rlp::parse_unsigned_legacy_tx;
+use rlp::{parse_unsigned_evm_tx, UnsignedEvmTx, ERC20_TRANSFER_SELECTOR};
 
 /// mpc contract on testnet. mainnet uses `v1.signer`.
 pub const MPC_CONTRACT: &str = "v1.signer-prod.testnet";
@@ -45,6 +53,9 @@ pub const MAX_POLICIES: u32 = 512;
 /// max allowed recipients per policy. empty list = deny all (fail-closed).
 pub const MAX_ALLOWED_RECIPIENTS: usize = 32;
 
+/// max allowed chain IDs per policy. empty list = deny all (fail-closed).
+pub const MAX_ALLOWED_CHAINS: usize = 16;
+
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
 pub struct Policy {
     /// who controls this policy (can update/freeze/reset).
@@ -63,6 +74,8 @@ pub struct Policy {
     /// allowed destination addresses (evm hex, lowercase, 0x prefix).
     /// empty = deny all — fail-closed by design.
     pub allowed_recipients: Vec<String>,
+    /// allowed chain IDs (e.g., 11155111 for Sepolia). empty = deny all chains.
+    pub allowed_chain_ids: Vec<u64>,
     // --- mutable state ---
     pub spent_today: u128,
     pub day_slot: u64,
@@ -123,7 +136,8 @@ impl Contract {
             daily_limit: daily_limit.0,
             cooldown_blocks,
             rate_limit_per_day: rate_limit_per_day.max(1),
-            allowed_recipients: Vec::new(), // empty = deny all until set
+            allowed_recipients: Vec::new(),   // empty = deny all until set
+            allowed_chain_ids: Vec::new(),    // empty = deny all chains until set
             spent_today: 0,
             day_slot: current_day_slot(),
             requests_today: 0,
@@ -206,6 +220,33 @@ impl Contract {
         view
     }
 
+    /// set allowed chain IDs for this policy. owner only.
+    /// empty list = deny all chains (fail-closed).
+    /// typical values: 11155111 (Sepolia), 1 (Ethereum mainnet), etc.
+    pub fn set_allowed_chain_ids(
+        &mut self,
+        policy_id: String,
+        chain_ids: Vec<u64>,
+    ) -> PolicyView {
+        let mut policy = self.policy_owned(&policy_id);
+        require!(
+            chain_ids.len() <= MAX_ALLOWED_CHAINS,
+            "too many chain IDs"
+        );
+        let mut seen = std::collections::HashSet::new();
+        policy.allowed_chain_ids = chain_ids
+            .into_iter()
+            .filter(|c| seen.insert(*c))
+            .collect();
+        let view = policy.clone().into_view();
+        self.policies.insert(policy_id.clone(), policy);
+        env::log_str(&format!(
+            "{{\"event\":\"allowed_chain_ids_updated\",\"policy\":\"{}\",\"count\":{}}}",
+            policy_id, view.allowed_chain_ids.len()
+        ));
+        view
+    }
+
     /// manual kill switch — freezes the wallet on every chain at once.
     /// owner only. one write, nothing gets signed until unfreeze.
     pub fn freeze(&mut self, policy_id: String) -> PolicyView {
@@ -213,7 +254,7 @@ impl Contract {
         policy.frozen = true;
         let view = policy.clone().into_view();
         self.policies.insert(policy_id.clone(), policy);
-        env::log_str(&deny(&policy_id, "frozen", 0, ""));
+        env::log_str(&deny(&policy_id, "frozen", 0, "", None));
         view
     }
 
@@ -275,33 +316,61 @@ impl Contract {
             policy.requests_today = 0;
         }
 
-        // derive amount + recipient from the payload itself — the agent
+        // derive amount + recipient + chain_id from the payload itself — the agent
         // has no say in what is checked. malformed RLP = fail-closed.
-        let tx = parse_unsigned_legacy_tx(&payload)
+        let tx = parse_unsigned_evm_tx(&payload)
             .unwrap_or_else(|e| env::panic_str(&format!("SHEARPIN_RLP_ERROR: {:?}", e)));
-        let amount = tx.value;
-        let recipient = tx.to;
+
+        // determine the actual amount and recipient based on tx type
+        let (amount, recipient, is_erc20) = if let (Some(erc20_to), Some(erc20_amt)) = (tx.erc20_to.clone(), tx.erc20_amount) {
+            // ERC-20 transfer: value=0, real amount/recipient from calldata
+            (erc20_amt, erc20_to, true)
+        } else {
+            // native transfer: value and to from tx fields
+            (tx.value, tx.to.clone(), false)
+        };
+
+        // chain ID validation (fail-closed: empty list denies all chains)
+        if let Some(chain_id) = tx.chain_id {
+            if !policy.allowed_chain_ids.iter().any(|c| *c == chain_id) {
+                policy.tripped = true;
+                self.policies.insert(policy_id.clone(), policy);
+                env::log_str(&deny(&policy_id, "chain_not_allowed", amount, &recipient, Some(chain_id)));
+                return PromiseOrValue::Value(
+                    "SHEARPIN_CHAIN: chain ID not in allowlist — pin snapped".to_string(),
+                );
+            }
+        } else {
+            // legacy tx without chainId: only allowed if policy explicitly allows chain_id=0 (legacy)
+            // but we require EIP-155 for security (replay protection)
+            policy.tripped = true;
+            self.policies.insert(policy_id.clone(), policy);
+            env::log_str(&deny(&policy_id, "legacy_tx_rejected", amount, &recipient, None));
+            return PromiseOrValue::Value(
+                "SHEARPIN_LEGACY_TX: EIP-155 transaction required (chainId mandatory)".to_string(),
+            );
+        }
 
         // fixed check order — do not reorder. fail-closed on anything
         // unexpected. every deny PERSISTS state (trip flags, day rollover)
         // and returns Value instead of panicking.
         if policy.frozen {
-            env::log_str(&deny(&policy_id, "frozen", amount, &recipient));
+            env::log_str(&deny(&policy_id, "frozen", amount, &recipient, tx.chain_id));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_FROZEN");
         }
         if policy.tripped {
-            env::log_str(&deny(&policy_id, "tripped", amount, &recipient));
+            env::log_str(&deny(&policy_id, "tripped", amount, &recipient, tx.chain_id));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_TRIPPED");
         }
         if env::block_height() < policy.cooldown_until {
-            env::log_str(&deny(&policy_id, "cooldown", amount, &recipient));
+            env::log_str(&deny(&policy_id, "cooldown", amount, &recipient, tx.chain_id));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_COOLDOWN");
         }
         if policy.requests_today >= policy.rate_limit_per_day {
-            env::log_str(&deny(&policy_id, "rate", amount, &recipient));
+            env::log_str(&deny(&policy_id, "rate", amount, &recipient, tx.chain_id));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_RATE");
         }
@@ -309,7 +378,7 @@ impl Contract {
         if !policy.allowed_recipients.iter().any(|r| r == &recipient) {
             policy.tripped = true;
             self.policies.insert(policy_id.clone(), policy);
-            env::log_str(&deny(&policy_id, "recipient_not_allowed", amount, &recipient));
+            env::log_str(&deny(&policy_id, "recipient_not_allowed", amount, &recipient, tx.chain_id));
             return PromiseOrValue::Value(
                 "SHEARPIN_RECIPIENT: destination not in allowlist — pin snapped".to_string(),
             );
@@ -322,7 +391,7 @@ impl Contract {
             // deny event, and return without ever requesting a signature.
             policy.tripped = true;
             self.policies.insert(policy_id.clone(), policy);
-            env::log_str(&deny(&policy_id, "over_tx_snap", amount, &recipient));
+            env::log_str(&deny(&policy_id, "over_tx_snap", amount, &recipient, tx.chain_id));
             return PromiseOrValue::Value(
                 "SHEARPIN_OVER_TX: amount above per-tx cap — pin snapped".to_string(),
             );
@@ -332,7 +401,7 @@ impl Contract {
             // persist first, never panic, no signature is ever requested.
             policy.tripped = true;
             self.policies.insert(policy_id.clone(), policy);
-            env::log_str(&deny(&policy_id, "over_daily_snap", amount, &recipient));
+            env::log_str(&deny(&policy_id, "over_daily_snap", amount, &recipient, tx.chain_id));
             return PromiseOrValue::Value(
                 "SHEARPIN_OVER_DAILY: daily cap exceeded — pin snapped".to_string(),
             );
@@ -347,8 +416,14 @@ impl Contract {
         self.policies.insert(policy_id.clone(), policy);
 
         env::log_str(&format!(
-            "{{\"event\":\"allow\",\"policy\":\"{}\",\"amount\":{},\"recipient\":\"{}\",\"spent_today\":{},\"requests_today\":{}}}",
-            policy_id, amount, recipient, spent, reqs
+            "{{\"event\":\"allow\",\"policy\":\"{}\",\"amount\":{},\"recipient\":\"{}\",\"spent_today\":{},\"requests_today\":{},\"is_erc20\":{},\"chain_id\":{}}}",
+            policy_id,
+            amount,
+            recipient,
+            spent,
+            reqs,
+            is_erc20,
+            tx.chain_id.map(|c| c.to_string()).unwrap_or("null".to_string())
         ));
 
         // hash the checked payload on-chain: the MPC signature can only
@@ -482,10 +557,11 @@ fn status_of(p: Option<Policy>) -> String {
     }
 }
 
-fn deny(policy_id: &str, reason: &str, amount: u128, recipient: &str) -> String {
+fn deny(policy_id: &str, reason: &str, amount: u128, recipient: &str, chain_id: Option<u64>) -> String {
+    let chain_part = chain_id.map(|c| format!("\"chain_id\":{}", c)).unwrap_or("\"chain_id\":null".to_string());
     format!(
-        "{{\"event\":\"deny\",\"policy\":\"{}\",\"reason\":\"{}\",\"amount\":{},\"recipient\":\"{}\"}}",
-        policy_id, reason, amount, recipient
+        "{{\"event\":\"deny\",\"policy\":\"{}\",\"reason\":\"{}\",\"amount\":{},\"recipient\":\"{}\",{}}}",
+        policy_id, reason, amount, recipient, chain_part
     )
 }
 
@@ -504,6 +580,7 @@ pub struct PolicyView {
     pub frozen: bool,
     pub status: String,
     pub allowed_recipients: Vec<String>,
+    pub allowed_chain_ids: Vec<u64>,
 }
 
 impl From<Policy> for PolicyView {
@@ -522,6 +599,7 @@ impl From<Policy> for PolicyView {
             frozen: p.frozen,
             status,
             allowed_recipients: p.allowed_recipients,
+            allowed_chain_ids: p.allowed_chain_ids,
         }
     }
 }
