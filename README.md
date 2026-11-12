@@ -84,6 +84,8 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 | Attack | How it's stopped |
 |---|---|
 | **Amount spoofing** (declare 1, sign 100 ETH) | Amount is parsed on-chain from the RLP `value` field — the agent never claims an amount |
+| **Gas-fee drain** (huge gasPrice burns funds) | `max_gas_price` cap per policy; gas burn (`gasPrice × gasLimit`) is charged to the daily budget |
+| **Token decimals confusion** (6-decimal USDC vs 18-decimal ETH) | Per-token `allowed_tokens` caps in raw token units — a token not in the list is denied outright |
 | **Calldata abuse** (allowlisted contract + `transfer(attacker, all)`) | Calldata must be ERC-20 `transfer`; real recipient + amount are decoded from calldata and run through the same allowlist + caps. Unknown selectors are rejected |
 | **Cross-chain replay** (same sig valid everywhere) | EIP-155 `chainId` is mandatory and checked against `allowed_chain_ids`; legacy (pre-EIP-155) txs are rejected |
 | **Unauthorized recipient** (attacker address) | Recipient allowlist, fail-closed: empty list denies all |
@@ -188,7 +190,7 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 ## Live Proof
 
 - **On-chain policy verification:** 5-scene demo (allow → recipient deny+snap → tripped containment → chainId deny → ERC-20 calldata recipient deny) executed live against `v3.shearpin-owner-1.testnet`
-- **MPC signature + Sepolia broadcast:** [Real Sepolia tx](https://sepolia.etherscan.io/tx/0xa3cf0383e326b752c0198150284a36abc8ce27a261a3e4b9c3dc9846076448d0) signed via NEAR Chain Signatures, policy-checked on NEAR, broadcast to Sepolia
+- **MPC signature + Sepolia broadcast:** [Real Sepolia tx](https://sepolia.etherscan.io/tx/0xf88b69bb83d63d02d445a9a6e5d69bceb514ec3a84b275462c14ffde16abc559) signed via NEAR Chain Signatures, policy-checked on NEAR, broadcast to Sepolia
 - **Agent address:** `0x33de51b35230a265F48D114e4d923432c597eCb4` (deterministically derived from path `shearpin/sat1/eth/0`)
 
 ## Limitations (Honest)

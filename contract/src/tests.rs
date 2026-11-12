@@ -24,6 +24,9 @@ fn fresh() -> Contract {
     Contract::new()
 }
 
+/// gas burned per allow in tests: 20 gwei * 21000
+const GAS_BURN_PER_TX: u128 = 420_000_000_000_000;
+
 fn make_policy(c: &mut Contract, id: &str, max_tx: u128, daily: u128) {
     c.create_policy(id.into(), "sat-1".into(), U128(max_tx), U128(daily), 10, 5);
 }
@@ -194,9 +197,59 @@ fn make_erc20_tx(token_hex: &str, recipient_hex: &str, amount: u128, chain_id: u
     rlp
 }
 
+
+/// like make_eip155_tx but with a custom gasPrice (for gas-cap tests)
+fn make_eip155_tx_gas_price(gas_price: u128, amount: u128) -> Vec<u8> {
+    let hex = VENDOR.trim_start_matches("0x");
+    let mut to_bytes = vec![];
+    for i in (0..hex.len()).step_by(2) {
+        to_bytes.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+    }
+    let gp_item: Vec<u8> = {
+        let mut bytes = vec![];
+        let mut v = gas_price;
+        while v > 0 { bytes.push((v & 0xff) as u8); v >>= 8; }
+        bytes.reverse();
+        let mut item = vec![0x80 + bytes.len() as u8];
+        item.extend(bytes);
+        item
+    };
+    let value_item: Vec<u8> = {
+        let mut bytes = vec![];
+        let mut v = amount;
+        while v > 0 { bytes.push((v & 0xff) as u8); v >>= 8; }
+        bytes.reverse();
+        let mut item = vec![0x80 + bytes.len() as u8];
+        item.extend(bytes);
+        item
+    };
+    let mut inner: Vec<u8> = vec![];
+    inner.push(0x01);
+    inner.extend(&gp_item);
+    inner.extend([0x82, 0x52, 0x08]);
+    inner.push(0x94);
+    inner.extend(to_bytes);
+    inner.extend(&value_item);
+    inner.push(0x80);
+    inner.extend([0x83, 0xaa, 0x36, 0xa7]);
+    inner.push(0x80);
+    inner.push(0x80);
+    let len = inner.len();
+    let mut rlp = vec![];
+    if len <= 55 { rlp.push(0xc0 + len as u8); } else {
+        let mut lb = vec![]; let mut l = len;
+        while l > 0 { lb.push((l & 0xff) as u8); l >>= 8; }
+        lb.reverse();
+        rlp.push(0xf7 + lb.len() as u8);
+        rlp.extend(lb);
+    }
+    rlp.extend(inner);
+    rlp
+}
+
 /// policy with signer bob + vendor allowlist + sepolia chain — the standard demo setup
 fn setup_demo_policy(c: &mut Contract, id: &str, max_tx: u128, daily: u128) {
-    make_policy(c, id, max_tx, daily);
+    make_policy(c, id, max_tx, daily + 10 * GAS_BURN_PER_TX);
     c.set_signer(id.into(), bob());
     c.set_allowed_recipients(id.into(), vec![VENDOR.into()]);
     c.set_allowed_chain_ids(id.into(), vec![11155111]); // Sepolia
@@ -267,7 +320,7 @@ fn create_and_read_policy() {
     make_policy(&mut c, "p1", 100, 500);
     let v = c.get_policy("p1".into()).unwrap();
     assert_eq!(v.max_tx, 100);
-    assert_eq!(v.daily_limit, 500);
+    assert_eq!(v.daily_limit, 500); // plain make_policy — no padding
     assert_eq!(v.status, "ok");
     assert_eq!(c.policy_len(), 1);
     // fresh policy denies all recipients and chains (fail-closed default)
@@ -310,7 +363,7 @@ fn missing_policy_fails_closed() {
 fn stranger_cannot_request() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let charlie: AccountId = "charlie.near".parse().unwrap();
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = charlie;
@@ -327,7 +380,7 @@ fn stranger_cannot_request() {
 fn signer_can_request_after_registration() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
@@ -338,7 +391,7 @@ fn signer_can_request_after_registration() {
 fn over_tx_cap_snaps_pin() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
@@ -351,7 +404,7 @@ fn over_tx_cap_snaps_pin() {
 fn pin_trips_on_over_tx_and_blocks_next() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut p = c.policies.get(&"p1".to_string()).cloned().unwrap();
     p.tripped = true;
     c.policies.insert("p1".to_string(), p.clone());
@@ -364,7 +417,7 @@ fn pin_trips_on_over_tx_and_blocks_next() {
 fn tripped_pin_denies_requests() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut p = c.policies.get(&"p1".to_string()).cloned().unwrap();
     p.tripped = true;
     c.policies.insert("p1".to_string(), p.clone());
@@ -376,9 +429,12 @@ fn tripped_pin_denies_requests() {
 fn over_daily_cap_snaps_pin() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    // rate limit high (10) so the DAILY cap trips, not the rate cap
-    setup_demo_policy_rate(&mut c, "p1", 100, 500, 10);
-    for i in 0..5 {
+    // rate limit high (10) so the DAILY cap trips, not the rate cap.
+    // each allow burns 100 value + 4.2e14 gas = ~4.2e14 total. daily cap
+    // is set so exactly 2 allows fit; the 3rd (tiny) request trips it.
+    let daily: u128 = 2 * (100 + GAS_BURN_PER_TX) + 1;
+    setup_demo_policy_rate(&mut c, "p1", 100, daily, 10);
+    for i in 0..2 {
         let mut ctx = base_ctx(); ctx.block_index += 100 * (i + 1); ctx.predecessor_account_id = bob(); testing_env!(ctx);
         expect_allow(&mut c, "p1", make_eip155_tx(100));
     }
@@ -391,7 +447,7 @@ fn over_daily_cap_snaps_pin() {
 fn cooldown_blocks_rapid_fire() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     expect_allow(&mut c, "p1", make_eip155_tx(10));
     assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(10)), "SHEARPIN_COOLDOWN");
@@ -401,7 +457,7 @@ fn cooldown_blocks_rapid_fire() {
 fn rate_cap_trips() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 10_000);
+    setup_demo_policy(&mut c, "p1", 100, 10_000 * 10^15 as u128);
     for i in 0..5 {
         let mut ctx = base_ctx(); ctx.block_index += 100 * (i + 1); ctx.predecessor_account_id = bob(); testing_env!(ctx);
         expect_allow(&mut c, "p1", make_eip155_tx(10));
@@ -414,7 +470,7 @@ fn rate_cap_trips() {
 fn freeze_blocks_everything() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     c.freeze("p1".into());
     let mut ctx = base_ctx(); ctx.block_index += 100; ctx.predecessor_account_id = bob(); testing_env!(ctx);
     assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx(1)), "SHEARPIN_FROZEN");
@@ -424,7 +480,7 @@ fn freeze_blocks_everything() {
 fn unfreeze_restores() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     c.freeze("p1".into());
     assert_eq!(c.policy_status("p1".into()), "frozen");
     c.unfreeze("p1".into());
@@ -436,7 +492,7 @@ fn unfreeze_restores() {
 fn only_owner_can_freeze() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
@@ -448,7 +504,7 @@ fn only_owner_can_freeze() {
 fn only_owner_can_update() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx();
     ctx.predecessor_account_id = bob();
     testing_env!(ctx);
@@ -459,11 +515,11 @@ fn only_owner_can_update() {
 fn day_rollover_resets_counters() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     expect_allow(&mut c, "p1", make_eip155_tx(100));
     let v = c.get_policy("p1".into()).unwrap();
-    assert_eq!(v.spent_today, 100);
+    assert_eq!(v.spent_today, 100 + GAS_BURN_PER_TX); // value + gas burn
 
     let mut ctx = base_ctx();
     ctx.block_index += BLOCKS_PER_DAY + 100;
@@ -471,7 +527,7 @@ fn day_rollover_resets_counters() {
     testing_env!(ctx);
     expect_allow(&mut c, "p1", make_eip155_tx(50));
     let v = c.get_policy("p1".into()).unwrap();
-    assert_eq!(v.spent_today, 50, "day rollover must reset spent_today");
+    assert_eq!(v.spent_today, 50 + GAS_BURN_PER_TX, "day rollover must reset spent_today");
     assert_eq!(v.requests_today, 1);
 }
 
@@ -479,7 +535,7 @@ fn day_rollover_resets_counters() {
 fn update_policy_changes_limits() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let v = c.update_policy("p1".into(), Some(U128(200)), Some(U128(1000)), None, None);
     assert_eq!(v.max_tx, 200);
     assert_eq!(v.daily_limit, 1000);
@@ -497,7 +553,7 @@ fn init_is_fresh_per_env() {
 fn unknown_key_type_rejected() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     c.request_signature(
         "p1".into(),
@@ -525,7 +581,7 @@ fn empty_allowlist_denies_all() {
 fn recipient_not_in_allowlist_denied() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     // attacker address not in the allowlist
     let attacker = "0x0000000000000000000000000000000000000001";
@@ -539,7 +595,7 @@ fn amount_comes_from_rlp_not_caller() {
     // value field is 101 must trip even though the caller "said" nothing.
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     let payload = make_eip155_tx(101); // value baked into the RLP
     assert_eq!(expect_deny(&mut c, "p1", payload), "SHEARPIN_OVER_TX");
@@ -560,7 +616,7 @@ fn rlp_parse_extracts_correct_amount_and_recipient() {
 fn malformed_rlp_fails_closed() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     c.request_signature(
         "p1".into(),
@@ -621,7 +677,7 @@ fn too_many_chain_ids_rejected() {
 fn chain_not_in_allowlist_denied() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500); // only chain 11155111 allowed
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128); // only chain 11155111 allowed
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     // try mainnet chainId=1 (not in allowlist)
     assert_eq!(expect_deny(&mut c, "p1", make_eip155_tx_to_addr(VENDOR, 10, 1)), "SHEARPIN_CHAIN");
@@ -632,7 +688,7 @@ fn chain_not_in_allowlist_denied() {
 fn legacy_tx_rejected() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     // legacy 6-field tx (no chainId) - should be rejected
     let legacy = make_rlp_tx_legacy(10);
@@ -713,11 +769,12 @@ fn erc20_transfer_parsed_correctly() {
 fn erc20_transfer_allowed_when_recipient_in_allowlist() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    // add both token contract AND recipient to allowlist
-    make_policy(&mut c, "p1", 100_000_000, 500_000_000);
+    // add recipient to allowlist + token to allowed_tokens
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
     c.set_signer("p1".into(), bob());
     c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
     c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(10_000_000))]);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
     expect_allow(&mut c, "p1", rlp);
@@ -727,11 +784,12 @@ fn erc20_transfer_allowed_when_recipient_in_allowlist() {
 fn erc20_transfer_denied_when_recipient_not_in_allowlist() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    make_policy(&mut c, "p1", 100_000_000, 500_000_000);
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
     c.set_signer("p1".into(), bob());
     // only token contract in allowlist, NOT the recipient
     c.set_allowed_recipients("p1".into(), vec![TOKEN.into()]);
     c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(10_000_000))]);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
     assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_RECIPIENT");
@@ -742,14 +800,45 @@ fn erc20_transfer_denied_when_recipient_not_in_allowlist() {
 fn erc20_transfer_amount_checked_against_caps() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    make_policy(&mut c, "p1", 500_000, 1_000_000); // max_tx = 500k
+    // per-token cap 500k; amount 1M must trip the TOKEN cap
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
     c.set_signer("p1".into(), bob());
     c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
     c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(500_000))]);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    // amount 1M > max_tx 500k
     let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000_000, 11155111);
-    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_OVER_TX");
+    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_TOKEN_OVER_CAP");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn erc20_unknown_token_denied() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    // NO set_allowed_tokens -> any ERC-20 must be denied
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    let rlp = make_erc20_tx(TOKEN, VENDOR, 1_000, 11155111);
+    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_TOKEN");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn gas_price_over_cap_snaps_pin() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    make_policy(&mut c, "p1", 1_000_000_000_000_000_000, 10_000_000_000_000_000_000);
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    // default cap = 500 gwei; build a tx with 1000 gwei gasPrice
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    let rlp = make_eip155_tx_gas_price(1_000_000_000_000u128, 10);
+    assert_eq!(expect_deny(&mut c, "p1", rlp), "SHEARPIN_GAS_PRICE");
     assert_eq!(c.policy_status("p1".into()), "tripped");
 }
 
@@ -757,7 +846,7 @@ fn erc20_transfer_amount_checked_against_caps() {
 fn unknown_calldata_rejected() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    setup_demo_policy(&mut c, "p1", 100, 500);
+    setup_demo_policy(&mut c, "p1", 100, 500 * 10^15 as u128);
     let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
     // tx with unknown selector (0xdeadbeef) in calldata
     let rlp = make_unknown_calldata_tx(11155111);
