@@ -161,7 +161,7 @@ The agent NEAR account signs with a **function-call access key scoped to one con
 
 It cannot transfer NEAR, call any other contract, add keys, or delete the account. Stealing it buys the thief exactly one capability: requesting signatures that must pass every policy gate. `freeze()` (owner-only) still stops everything instantly.
 
-Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added).
+Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
 
 ---
 

@@ -61,18 +61,11 @@ try {
     actions: [
       actions.createAccount(),
       actions.transfer(2n * 10n ** 24n), // gas money only
-      actions.addKey(
+      actions.addFunctionCallAccessKey(
         pub,
-        {
-          nonce: 0,
-          permission: {
-            FunctionCall: {
-              receiver_id: CONTRACT,
-              method_names: ["request_signature"],
-              allowance: BigInt(50).valueOf() * 10n ** 24n, // 50 NEAR for MPC deposit fees
-            },
-          },
-        },
+        CONTRACT,                     // receiver: ONLY the ShearPin contract
+        ["request_signature"],        // methods: ONLY the policy-gated entry point
+        50n * 10n ** 24n,             // allowance: 50 NEAR for MPC deposit fees
       ),
     ],
   });
@@ -81,7 +74,7 @@ try {
 
 // 3. verify the key on-chain
 const keyInfo = await provider.query({
-  request_type: "access_key_list",
+  request_type: "view_access_key_list",
   account_id: AGENT_ID,
   finality: "final",
 });
