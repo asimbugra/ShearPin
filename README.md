@@ -4,7 +4,7 @@
 
 > A shear pin is the mechanical safety device that snaps when torque exceeds the limit — the machine survives. ShearPin does the same for agent wallets: when a spend exceeds policy, the signature is refused. The agent survives; your funds survive.
 
-**Live on NEAR testnet:** `contract.shearpin-owner-1.testnet`  
+**Live on NEAR testnet:** `shearpin-agent-1.testnet`  
 **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
 ---
@@ -151,7 +151,7 @@ scripts/gen-keys.js  One-time keypair generator for testnet accounts
 
 ## Measured Performance (live testnet)
 
-Measured on `contract.shearpin-owner-1.testnet` (NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`.
+Measured on `shearpin-agent-1.testnet` (NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`.
 
 | Path | What happens | Latency | Gas |
 |---|---|---|---|
