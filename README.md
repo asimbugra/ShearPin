@@ -185,6 +185,12 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 
 ---
 
+## Live Proof
+
+- **On-chain policy verification:** 5-scene demo (allow → recipient deny+snap → tripped containment → chainId deny → ERC-20 calldata recipient deny) executed live against `v3.shearpin-owner-1.testnet`
+- **MPC signature + Sepolia broadcast:** [Real Sepolia tx](https://sepolia.etherscan.io/tx/0xa3cf0383e326b752c0198150284a36abc8ce27a261a3e4b9c3dc9846076448d0) signed via NEAR Chain Signatures, policy-checked on NEAR, broadcast to Sepolia
+- **Agent address:** `0x33de51b35230a265F48D114e4d923432c597eCb4` (deterministically derived from path `shearpin/sat1/eth/0`)
+
 ## Limitations (Honest)
 
 - **Testnet only** — contract deployed to `v1.signer-prod.testnet`, not mainnet `v1.signer`
