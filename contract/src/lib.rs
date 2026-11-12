@@ -6,8 +6,14 @@
 //! the policy check first. no relay, no off-chain guard — if the policy
 //! says no, the signature request is never made.
 //!
+//! the agent submits the raw RLP-encoded unsigned EVM transaction; the
+//! contract parses it on-chain (see rlp.rs) and derives the amount and
+//! recipient itself. the agent never claims an amount, so it cannot
+//! declare "1" while having a large transfer signed.
+//!
 //! check order is fixed and fail-closed:
-//!   frozen -> day rollover -> cooldown -> rate -> per-tx cap -> daily cap
+//!   frozen -> day rollover -> cooldown -> rate -> recipient allowlist
+//!   -> per-tx cap -> daily cap
 
 use near_sdk::borsh::{self, BorshDeserialize, BorshSerialize};
 use near_sdk::store::IterableMap;
@@ -17,6 +23,9 @@ use near_sdk::{
     env, ext_contract, near, require, AccountId, BlockHeight, PanicOnDefault, Promise,
     PromiseOrValue,
 };
+
+mod rlp;
+use rlp::parse_unsigned_legacy_tx;
 
 /// mpc contract on testnet. mainnet uses `v1.signer`.
 pub const MPC_CONTRACT: &str = "v1.signer-prod.testnet";
@@ -33,6 +42,9 @@ pub const BLOCKS_PER_DAY: u64 = 86_400;
 /// max policies the contract will store (sanity bound).
 pub const MAX_POLICIES: u32 = 512;
 
+/// max allowed recipients per policy. empty list = deny all (fail-closed).
+pub const MAX_ALLOWED_RECIPIENTS: usize = 32;
+
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq)]
 pub struct Policy {
     /// who controls this policy (can update/freeze/reset).
@@ -48,6 +60,9 @@ pub struct Policy {
     pub cooldown_blocks: u64,
     /// max requests allowed per day slot.
     pub rate_limit_per_day: u32,
+    /// allowed destination addresses (evm hex, lowercase, 0x prefix).
+    /// empty = deny all — fail-closed by design.
+    pub allowed_recipients: Vec<String>,
     // --- mutable state ---
     pub spent_today: u128,
     pub day_slot: u64,
@@ -108,6 +123,7 @@ impl Contract {
             daily_limit: daily_limit.0,
             cooldown_blocks,
             rate_limit_per_day: rate_limit_per_day.max(1),
+            allowed_recipients: Vec::new(), // empty = deny all until set
             spent_today: 0,
             day_slot: current_day_slot(),
             requests_today: 0,
@@ -156,6 +172,40 @@ impl Contract {
         self.signers.insert(policy_id.clone(), signer);
     }
 
+    /// set allowed destination addresses for this policy. owner only.
+    /// entries are normalized to lowercase 0x-prefixed hex and deduped.
+    /// an EMPTY list denies all transfers — fail-closed by design.
+    pub fn set_allowed_recipients(
+        &mut self,
+        policy_id: String,
+        recipients: Vec<String>,
+    ) -> PolicyView {
+        let mut policy = self.policy_owned(&policy_id);
+        require!(
+            recipients.len() <= MAX_ALLOWED_RECIPIENTS,
+            "too many recipients"
+        );
+        let normalized: Vec<String> = recipients
+            .into_iter()
+            .map(|r| {
+                let r = r.trim().to_lowercase();
+                if r.starts_with("0x") { r } else { format!("0x{}", r) }
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        policy.allowed_recipients = normalized
+            .into_iter()
+            .filter(|r| seen.insert(r.clone()))
+            .collect();
+        let view = policy.clone().into_view();
+        self.policies.insert(policy_id.clone(), policy);
+        env::log_str(&format!(
+            "{{\"event\":\"allowed_recipients_updated\",\"policy\":\"{}\",\"count\":{}}}",
+            policy_id, view.allowed_recipients.len()
+        ));
+        view
+    }
+
     /// manual kill switch — freezes the wallet on every chain at once.
     /// owner only. one write, nothing gets signed until unfreeze.
     pub fn freeze(&mut self, policy_id: String) -> PolicyView {
@@ -163,7 +213,7 @@ impl Contract {
         policy.frozen = true;
         let view = policy.clone().into_view();
         self.policies.insert(policy_id.clone(), policy);
-        env::log_str(&deny(&policy_id, "frozen", 0));
+        env::log_str(&deny(&policy_id, "frozen", 0, ""));
         view
     }
 
@@ -198,16 +248,18 @@ impl Contract {
     // the hot path: agent asks, policy decides before any mpc call
     // ------------------------------------------------------------------
 
-    /// request a chain-signatures signature for `payload` after policy
-    /// check. `amount` is the value leaving the wallet, checked against
-    /// the caps. denials do NOT panic — a panic would revert the trip
-    /// flag. instead we persist the new state, emit a deny event, and
-    /// return Value(deny) so the mpc network is never called.
+    /// request a chain-signatures signature for an RLP-encoded unsigned
+    /// EVM transaction after policy check. the contract parses the RLP
+    /// on-chain to derive amount (value) and recipient (to) — the agent
+    /// never claims an amount. the 32-byte payload hash for MPC is
+    /// computed here via keccak256, so the signature can only ever apply
+    /// to the transaction that was policy-checked. denials PERSIST state
+    /// (trip flags, day rollover) and return Value instead of panicking,
+    /// so the mpc network is never called and the trip survives.
     #[payable]
     pub fn request_signature(
         &mut self,
         policy_id: String,
-        amount: U128,
         derivation_path: String,
         key_type: String,
         payload: Vec<u8>,
@@ -223,30 +275,46 @@ impl Contract {
             policy.requests_today = 0;
         }
 
+        // derive amount + recipient from the payload itself — the agent
+        // has no say in what is checked. malformed RLP = fail-closed.
+        let tx = parse_unsigned_legacy_tx(&payload)
+            .unwrap_or_else(|e| env::panic_str(&format!("SHEARPIN_RLP_ERROR: {:?}", e)));
+        let amount = tx.value;
+        let recipient = tx.to;
+
         // fixed check order — do not reorder. fail-closed on anything
         // unexpected. every deny PERSISTS state (trip flags, day rollover)
         // and returns Value instead of panicking.
         if policy.frozen {
-            env::log_str(&deny(&policy_id, "frozen", amount.0));
+            env::log_str(&deny(&policy_id, "frozen", amount, &recipient));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_FROZEN");
         }
         if policy.tripped {
-            env::log_str(&deny(&policy_id, "tripped", amount.0));
+            env::log_str(&deny(&policy_id, "tripped", amount, &recipient));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_TRIPPED");
         }
         if env::block_height() < policy.cooldown_until {
-            env::log_str(&deny(&policy_id, "cooldown", amount.0));
+            env::log_str(&deny(&policy_id, "cooldown", amount, &recipient));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_COOLDOWN");
         }
         if policy.requests_today >= policy.rate_limit_per_day {
-            env::log_str(&deny(&policy_id, "rate", amount.0));
+            env::log_str(&deny(&policy_id, "rate", amount, &recipient));
             self.policies.insert(policy_id.clone(), policy);
             env::panic_str("SHEARPIN_RATE");
         }
-        if amount.0 > policy.max_tx {
+        // recipient allowlist — fail-closed: empty list denies everything
+        if !policy.allowed_recipients.iter().any(|r| r == &recipient) {
+            policy.tripped = true;
+            self.policies.insert(policy_id.clone(), policy);
+            env::log_str(&deny(&policy_id, "recipient_not_allowed", amount, &recipient));
+            return PromiseOrValue::Value(
+                "SHEARPIN_RECIPIENT: destination not in allowlist — pin snapped".to_string(),
+            );
+        }
+        if amount > policy.max_tx {
             // soft breach: deny + snap the pin. the agent tried to move
             // more than a single transaction may ever move. NOTE: we must
             // NOT panic here — a panic reverts ALL state, so the trip
@@ -254,20 +322,24 @@ impl Contract {
             // deny event, and return without ever requesting a signature.
             policy.tripped = true;
             self.policies.insert(policy_id.clone(), policy);
-            env::log_str(&deny(&policy_id, "over_tx_snap", amount.0));
-            return PromiseOrValue::Value("SHEARPIN_OVER_TX: amount above per-tx cap — pin snapped".to_string());
+            env::log_str(&deny(&policy_id, "over_tx_snap", amount, &recipient));
+            return PromiseOrValue::Value(
+                "SHEARPIN_OVER_TX: amount above per-tx cap — pin snapped".to_string(),
+            );
         }
-        if policy.spent_today + amount.0 > policy.daily_limit {
+        if policy.spent_today + amount > policy.daily_limit {
             // hard breach of the daily budget: deny + trip. same rule —
             // persist first, never panic, no signature is ever requested.
             policy.tripped = true;
             self.policies.insert(policy_id.clone(), policy);
-            env::log_str(&deny(&policy_id, "over_daily_snap", amount.0));
-            return PromiseOrValue::Value("SHEARPIN_OVER_DAILY: daily cap exceeded — pin snapped".to_string());
+            env::log_str(&deny(&policy_id, "over_daily_snap", amount, &recipient));
+            return PromiseOrValue::Value(
+                "SHEARPIN_OVER_DAILY: daily cap exceeded — pin snapped".to_string(),
+            );
         }
 
         // passed — book the spend and set the cooldown
-        policy.spent_today += amount.0;
+        policy.spent_today += amount;
         policy.requests_today += 1;
         policy.cooldown_until = env::block_height() + policy.cooldown_blocks;
         let spent = policy.spent_today;
@@ -275,9 +347,13 @@ impl Contract {
         self.policies.insert(policy_id.clone(), policy);
 
         env::log_str(&format!(
-            "{{\"event\":\"allow\",\"policy\":\"{}\",\"amount\":{},\"spent_today\":{},\"requests_today\":{}}}",
-            policy_id, amount.0, spent, reqs
+            "{{\"event\":\"allow\",\"policy\":\"{}\",\"amount\":{},\"recipient\":\"{}\",\"spent_today\":{},\"requests_today\":{}}}",
+            policy_id, amount, recipient, spent, reqs
         ));
+
+        // hash the checked payload on-chain: the MPC signature can only
+        // ever apply to this exact transaction.
+        let payload_hash = env::keccak256(&payload);
 
         // forward to the mpc network. path is forced through the policy
         // namespace so an agent can never sign with someone else's
@@ -293,10 +369,9 @@ impl Contract {
         // v1.signer's `sign` takes SignRequestArgs:
         // { "request": { "payload_v2": {"Ecdsa": "<hex>"}, "path": ..., "domain_id": 0 } }
         // legacy flat form (payload: [u8;32], key_version) also accepted.
-        let hex_payload: String = payload.iter().map(|b| format!("{:02x}", b)).collect();
         let args = json!({
             "request": {
-                "payload": payload,
+                "payload": payload_hash,
                 "path": path,
                 "key_version": 0,
             }
@@ -407,10 +482,10 @@ fn status_of(p: Option<Policy>) -> String {
     }
 }
 
-fn deny(policy_id: &str, reason: &str, amount: u128) -> String {
+fn deny(policy_id: &str, reason: &str, amount: u128, recipient: &str) -> String {
     format!(
-        "{{\"event\":\"deny\",\"policy\":\"{}\",\"reason\":\"{}\",\"amount\":{}}}",
-        policy_id, reason, amount
+        "{{\"event\":\"deny\",\"policy\":\"{}\",\"reason\":\"{}\",\"amount\":{},\"recipient\":\"{}\"}}",
+        policy_id, reason, amount, recipient
     )
 }
 
@@ -428,6 +503,7 @@ pub struct PolicyView {
     pub tripped: bool,
     pub frozen: bool,
     pub status: String,
+    pub allowed_recipients: Vec<String>,
 }
 
 impl From<Policy> for PolicyView {
@@ -445,6 +521,7 @@ impl From<Policy> for PolicyView {
             tripped: p.tripped,
             frozen: p.frozen,
             status,
+            allowed_recipients: p.allowed_recipients,
         }
     }
 }
