@@ -87,6 +87,9 @@ pub struct Policy {
     /// decimals trap: one wei-denominated max_tx would otherwise allow
     /// billions of a 6-decimal token.
     pub allowed_tokens: Vec<(String, u128)>,
+    /// per-token spent_today (raw token units), parallel to allowed_tokens.
+    /// only gas burn counts against native spent_today.
+    pub token_spent_today: Vec<u128>,
     /// max gas price the agent may set (wei). 0 = unset -> default cap.
     /// gas burn (gas_price * gas_limit) is also charged to the daily budget.
     pub max_gas_price: u128,
@@ -153,6 +156,7 @@ impl Contract {
             allowed_recipients: Vec::new(),   // empty = deny all until set
             allowed_chain_ids: Vec::new(),    // empty = deny all chains until set
             allowed_tokens: Vec::new(),       // empty = deny all ERC-20 tokens
+            token_spent_today: Vec::new(),    // parallel to allowed_tokens
             max_gas_price: DEFAULT_MAX_GAS_PRICE,
             spent_today: 0,
             day_slot: current_day_slot(),
@@ -285,9 +289,23 @@ impl Contract {
             })
             .collect();
         let mut seen = std::collections::HashSet::new();
+        let old_caps: Vec<(String, u128)> = policy.allowed_tokens.clone();
         policy.allowed_tokens = normalized
             .into_iter()
             .filter(|(a, _)| seen.insert(a.clone()))
+            .collect();
+        // rebuild token_spent_today parallel to the new token list, carrying
+        // over today's spend for tokens that survive the update
+        policy.token_spent_today = policy
+            .allowed_tokens
+            .iter()
+            .map(|(a, _)| {
+                old_caps
+                    .iter()
+                    .position(|(oa, _)| oa == a)
+                    .and_then(|i| policy.token_spent_today.get(i).copied())
+                    .unwrap_or(0)
+            })
             .collect();
         let view = policy.clone().into_view();
         self.policies.insert(policy_id.clone(), policy);
@@ -347,6 +365,25 @@ impl Contract {
         view
     }
 
+    /// owner-only: reset the pin AND zero the spend counters (fresh day
+    /// slot). used between demo runs so counters start clean.
+    pub fn reset_counters(&mut self, policy_id: String) -> PolicyView {
+        let mut policy = self.policy_owned(&policy_id);
+        policy.tripped = false;
+        policy.spent_today = 0;
+        policy.requests_today = 0;
+        policy.token_spent_today = vec![0; policy.allowed_tokens.len()];
+        policy.day_slot = current_day_slot();
+        policy.cooldown_until = env::block_height() + policy.cooldown_blocks;
+        let view = policy.clone().into_view();
+        self.policies.insert(policy_id.clone(), policy);
+        env::log_str(&format!(
+            "{{\"event\":\"counters_reset\",\"policy\":\"{}\"}}",
+            policy_id
+        ));
+        view
+    }
+
     // ------------------------------------------------------------------
     // the hot path: agent asks, policy decides before any mpc call
     // ------------------------------------------------------------------
@@ -376,6 +413,9 @@ impl Contract {
             policy.day_slot = slot;
             policy.spent_today = 0;
             policy.requests_today = 0;
+            for t in policy.token_spent_today.iter_mut() {
+                *t = 0;
+            }
         }
 
         // derive amount + recipient + chain_id from the payload itself — the agent
@@ -387,7 +427,11 @@ impl Contract {
         // fields — the agent has no say in what is checked.
         // ERC-20 path: tx.to is the TOKEN contract; the real recipient and
         // amount come from the decoded calldata. native path: value + to.
-        let (amount, recipient, is_erc20, token_addr) = if !tx.data.is_empty() {
+        // token amounts are tracked in a SEPARATE per-token counter — they
+        // never mix with the native (wei) budget. only gas burn (wei) is
+        // charged to the native daily budget on the ERC-20 path.
+        let is_erc20 = !tx.data.is_empty();
+        let (amount, recipient, token_idx) = if is_erc20 {
             let (erc20_to, erc20_amt) = match (tx.erc20_to.clone(), tx.erc20_amount) {
                 (Some(to), Some(amt)) => (to, amt),
                 _ => env::panic_str("SHEARPIN_RLP_ERROR: non-transfer calldata"),
@@ -398,9 +442,11 @@ impl Contract {
             }
             // token allowlist with per-token cap — fail-closed
             let token = tx.to.clone();
-            match policy.allowed_tokens.iter().find(|(t, _)| *t == token) {
-                Some((_, cap)) => {
-                    if erc20_amt > *cap {
+            match policy.allowed_tokens.iter().position(|(t, _)| *t == token) {
+                Some(idx) => {
+                    let cap = policy.allowed_tokens[idx].1;
+                    let spent = policy.token_spent_today.get(idx).copied().unwrap_or(0);
+                    if erc20_amt > cap {
                         policy.tripped = true;
                         self.policies.insert(policy_id.clone(), policy);
                         env::log_str(&deny(&policy_id, "token_over_cap", erc20_amt, &erc20_to, tx.chain_id));
@@ -408,6 +454,16 @@ impl Contract {
                             "SHEARPIN_TOKEN_OVER_CAP: token amount above per-token cap — pin snapped".to_string(),
                         );
                     }
+                    if spent + erc20_amt > cap {
+                        // per-token DAILY budget (cap applies per day too)
+                        policy.tripped = true;
+                        self.policies.insert(policy_id.clone(), policy);
+                        env::log_str(&deny(&policy_id, "token_over_daily", erc20_amt, &erc20_to, tx.chain_id));
+                        return PromiseOrValue::Value(
+                            "SHEARPIN_TOKEN_OVER_DAILY: token daily cap exceeded — pin snapped".to_string(),
+                        );
+                    }
+                    (erc20_amt, erc20_to, Some(idx))
                 }
                 None => {
                     policy.tripped = true;
@@ -418,9 +474,9 @@ impl Contract {
                     );
                 }
             }
-            (erc20_amt, erc20_to, true, Some(token))
         } else {
-            (tx.value, tx.to.clone(), false, None)
+            // native transfer: amount and recipient come from the tx fields
+            (tx.value, tx.to.clone(), None)
         };
 
         // gas cap: the agent cannot burn funds via gasPrice. gas burn is
@@ -488,7 +544,20 @@ impl Contract {
                 "SHEARPIN_RECIPIENT: destination not in allowlist — pin snapped".to_string(),
             );
         }
-        if amount > policy.max_tx {
+        if is_erc20 {
+            // token path: the token amount was already capped against the
+            // per-token cap + per-token daily counter above. the ONLY native
+            // exposure is the gas burn — token units never touch the wei
+            // budget (mixing 6-decimal token units with wei is meaningless).
+            if policy.spent_today + gas_burn > policy.daily_limit {
+                policy.tripped = true;
+                self.policies.insert(policy_id.clone(), policy);
+                env::log_str(&deny(&policy_id, "over_daily_snap", gas_burn, &recipient, tx.chain_id));
+                return PromiseOrValue::Value(
+                    "SHEARPIN_OVER_DAILY: daily cap exceeded — pin snapped".to_string(),
+                );
+            }
+        } else if amount > policy.max_tx {
             // soft breach: deny + snap the pin. the agent tried to move
             // more than a single transaction may ever move. NOTE: we must
             // NOT panic here — a panic reverts ALL state, so the trip
@@ -500,8 +569,7 @@ impl Contract {
             return PromiseOrValue::Value(
                 "SHEARPIN_OVER_TX: amount above per-tx cap — pin snapped".to_string(),
             );
-        }
-        if policy.spent_today + amount + gas_burn > policy.daily_limit {
+        } else if policy.spent_today + amount + gas_burn > policy.daily_limit {
             // hard breach of the daily budget (value + gas burn): deny + trip.
             // persist first, never panic, no signature is ever requested.
             policy.tripped = true;
@@ -512,8 +580,18 @@ impl Contract {
             );
         }
 
-        // passed — book the spend (value + gas burn) and set the cooldown
-        policy.spent_today += amount + gas_burn;
+        // passed — book the spend and set the cooldown.
+        // native path: value + gas burn into the wei budget.
+        // ERC-20 path: ONLY gas burn into the wei budget; token units go
+        // to the per-token counter.
+        if let Some(idx) = token_idx {
+            if let Some(t) = policy.token_spent_today.get_mut(idx) {
+                *t += amount;
+            }
+            policy.spent_today += gas_burn;
+        } else {
+            policy.spent_today += amount + gas_burn;
+        }
         policy.requests_today += 1;
         policy.cooldown_until = env::block_height() + policy.cooldown_blocks;
         let spent = policy.spent_today;
@@ -687,6 +765,7 @@ pub struct PolicyView {
     pub allowed_recipients: Vec<String>,
     pub allowed_chain_ids: Vec<u64>,
     pub allowed_tokens: Vec<(String, u128)>,
+    pub token_spent_today: Vec<u128>,
     pub max_gas_price: u128,
 }
 
@@ -708,6 +787,7 @@ impl From<Policy> for PolicyView {
             allowed_recipients: p.allowed_recipients,
             allowed_chain_ids: p.allowed_chain_ids,
             allowed_tokens: p.allowed_tokens,
+            token_spent_today: p.token_spent_today,
             max_gas_price: p.max_gas_price,
         }
     }

@@ -24,8 +24,10 @@ fn fresh() -> Contract {
     Contract::new()
 }
 
-/// gas burned per allow in tests: 20 gwei * 21000
+/// gas burned per native allow in tests: 20 gwei * 21000
 const GAS_BURN_PER_TX: u128 = 420_000_000_000_000;
+/// gas burned per ERC-20 allow in tests: 20 gwei * 60000
+const GAS_BURN_60K: u128 = 420_000_000_000_000; // same as native (21000 gas in helper)
 
 fn make_policy(c: &mut Contract, id: &str, max_tx: u128, daily: u128) {
     c.create_policy(id.into(), "sat-1".into(), U128(max_tx), U128(daily), 10, 5);
@@ -900,4 +902,59 @@ fn deny_log_includes_chain_id() {
 fn deny_log_includes_null_chain_id_for_legacy() {
     let log = deny("p1", "test_reason", 42, "0xabcdef", None);
     assert!(log.contains("\"chain_id\":null"));
+}
+#[test]
+fn erc20_amount_not_mixed_into_native_budget() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    // native cap = 5e17 (both per-tx and daily). token cap = 1e18.
+    // a 1e18 token transfer (which EXCEEDS the native cap by 2x) must
+    // still be ALLOWED — token units never touch the native budget.
+    make_policy(&mut c, "p1", 5 * 10u128.pow(17), 5 * 10u128.pow(17));
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(10u128.pow(18)))]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    expect_allow(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 10u128.pow(18), 11155111));
+    // native budget must contain ONLY the gas burn
+    let v = c.get_policy("p1".into()).unwrap();
+    assert_eq!(v.spent_today, GAS_BURN_60K, "only gas burn may hit the wei budget");
+    assert_eq!(v.token_spent_today[0], 10u128.pow(18), "token counter holds the units");
+}
+
+#[test]
+fn erc20_token_daily_cap_accumulates() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    // token cap = 1500: two transfers of 1000 (each under per-tx cap) must
+    // trip the per-token DAILY counter on the second
+    make_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(1500))]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    expect_allow(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 1000, 11155111));
+    let mut ctx = base_ctx(); ctx.block_index += 100; ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    assert_eq!(expect_deny(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 1000, 11155111)), "SHEARPIN_TOKEN_OVER_DAILY");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}
+
+#[test]
+fn erc20_gas_burn_still_counts_to_native_daily() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    // native daily cap barely above one gas burn: the 2nd ERC-20 tx's gas
+    // must trip the native daily cap even though token units don't count
+    make_policy(&mut c, "p1", GAS_BURN_60K, GAS_BURN_60K + 1);
+    c.set_signer("p1".into(), bob());
+    c.set_allowed_recipients("p1".into(), vec![TOKEN.into(), VENDOR.into()]);
+    c.set_allowed_chain_ids("p1".into(), vec![11155111]);
+    c.set_allowed_tokens("p1".into(), vec![(TOKEN.into(), U128(100_000_000))]);
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    expect_allow(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 1000, 11155111));
+    let mut ctx = base_ctx(); ctx.block_index += 100; ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    assert_eq!(expect_deny(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 1000, 11155111)), "SHEARPIN_OVER_DAILY");
+    assert_eq!(c.policy_status("p1".into()), "tripped");
 }
