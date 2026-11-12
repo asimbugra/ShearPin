@@ -11,3 +11,4 @@ coverage/
 .env
 backend/shearpin.db*
 shearpin.db*
+!docs/*.log

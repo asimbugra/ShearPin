@@ -65,7 +65,7 @@ The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The 
 7. **Chain allowlist** — `chainId` must be in `allowed_chain_ids` (EIP-155 mandatory; legacy 6-field txs rejected)
 8. **Calldata policy** — empty data = native transfer; non-empty must be an ERC-20 `transfer(address,uint256)` (selector `0xa9059cbb`) with `value == 0`, decoded on-chain
 9. **Token allowlist** — ERC-20 `to` (token contract) must be in `allowed_tokens` with a per-token cap; token units are tracked in a **separate per-token daily counter**, never mixed with the wei budget
-10. **Counterparty blocklist** — shared evidence-backed reports: an address with ≥2 reports is denied for EVERY policy (`SHEARPIN_COUNTERPARTY_BLOCKED`), even if allowlisted
+10. **Counterparty blocklist** — shared evidence-backed reports: an address with ≥2 reports is denied (`SHEARPIN_COUNTERPARTY_BLOCKED`) for every policy whose owner has **not** allowlisted it (owner-allowlisted recipients only warn — see the Sybil note below)
 11. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
 12. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
 13. **Daily cap** — cumulative spend + gas burn cannot exceed `daily_limit` (snaps pin on breach)
@@ -96,7 +96,8 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 | **Rapid-fire drain** (many small txs) | Rate limit per day + cooldown blocks between requests |
 | **Buggy agent overspending** | Per-tx cap + daily cap snap the pin; owner resets deliberately |
 | **Prompt injection** (attacker tricks the agent into paying a bad address) | Agent-side wrapper runs a counterparty check first: **block** verdict → refuses to sign; on-chain gate enforces it again (`SHEARPIN_COUNTERPARTY_BLOCKED`) even if the wrapper is bypassed |
-| **Known-bad counterparty** (reported by other agents) | Shared on-chain blocklist: anyone can `report(address, category, evidence)`; 2+ evidence-backed reports hard-block the address for **every** policy |
+| **Known-bad counterparty** (reported by other agents) | Shared on-chain blocklist: anyone can `report(address, category, evidence)` with a 0.01 NEAR stake; 2+ evidence-backed reports hard-block the address for every policy whose owner hasn't allowlisted it |
+| **Sybil report mob** (two free accounts report your real supplier to snap the pin — a DoS) | Two layers: reports require a **0.01 NEAR stake each** (mass false-reporting burns the *reporter's* money), and an **owner-allowlisted address can never be counterparty-blocked** — reports only warn; the owner re-vets by removing the allowlist entry |
 
 ---
 
@@ -123,9 +124,11 @@ Before any payment the agent-side wrapper asks the contract about the receiver:
 check_counterparty(policy_id, address) -> verdict + reasons
 ```
 
-- **block** — the address has ≥2 evidence-backed reports on the shared blocklist. The wrapper **refuses to sign** (no tx is ever submitted), and the on-chain gate enforces the same verdict (`SHEARPIN_COUNTERPARTY_BLOCKED`, pin snaps) even if the wrapper is bypassed entirely.
-- **warn** — something deserves a human look: a single report exists, or the address is not in the policy's allowlist (unvetted). The wrapper calls its `onWarn` hook and only proceeds on explicit human approval.
+- **block** — the address has ≥2 evidence-backed reports on the shared blocklist **and is not in this policy's recipient allowlist**. The wrapper **refuses to sign** (no tx is ever submitted), and the on-chain gate enforces the same verdict (`SHEARPIN_COUNTERPARTY_BLOCKED`, pin snaps) even if the wrapper is bypassed entirely.
+- **warn** — something deserves a human look: a single report exists, the address is not in the policy's allowlist (unvetted), or reports exist on an **owner-allowlisted** address. The wrapper calls its `onWarn` hook and only proceeds on explicit human approval.
 - **allow** — allowlisted with zero reports.
+
+**Why allowlisted addresses only warn.** `report()` is permissionless by design — but that makes it a Sybil target: two free testnet accounts could hard-block your real supplier and snap the pin (a DoS). The defense is ownership: **an address the owner explicitly allowlisted can never be counterparty-blocked** — reports only warn, and the owner re-vets by removing the allowlist entry if the reports are credible. Everyone else's blocklist verdict is unchanged.
 
 **The shared blocklist.** Anyone can report a bad counterparty on-chain:
 
@@ -133,7 +136,7 @@ check_counterparty(policy_id, address) -> verdict + reasons
 report(address, category, evidence)   // evidence (URL or tx hash) is REQUIRED
 ```
 
-Reports are public, immutable, and carry their evidence — every other agent (any policy, any owner) inherits the block decision at 2+ reports. One report per reporter per address; state growth is capped.
+Each report requires an attached deposit of **0.01 NEAR** (`REPORT_DEPOSIT`) — an anti-Sybil stake that pays the report's storage and makes mass false-reporting expensive for the *reporter* (no refunds; spam burns the reporter's money, not the contract's balance). Reports are public, immutable, carry their evidence, one per reporter per address; 2+ reports hard-block the address for every policy that hasn't owner-allowlisted it.
 
 **Attack demo (live, with logs):** a prompt-injected agent is told to pay a known-bad address; the wrapper blocks, the off-chain signal reports are printed alongside (step 1.5, block is never downgraded), and the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`. Full log: [`docs/attack-demo.log`](docs/attack-demo.log), script: `agent-sim/attack-demo.mjs`.
 
@@ -145,9 +148,12 @@ Reports are public, immutable, and carry their evidence — every other agent (a
 | Recipient vetted by owner | Policy `allowed_recipients` | same view call; absence → warn |
 | Account age & activity | Etherscan V2 API (`ETHERSCAN_API_KEY`) | first-tx timestamp (`txlist` asc) → `< 7 days old` warns; last 25 txs → `low activity` warns |
 | Contract vs EOA + code change | `eth_getCode` via `SEPOLIA_RPC` | `"0x"` → EOA; contract code hash compared against the last observation — any change → warn |
+| EIP-7702 delegation | same `eth_getCode` call | code starts with `0xef0100…` → the "EOA" delegated to swappable contract code → warn |
 | Prior interactions | agent EOA `txlist` (`AGENT_EOA`) | prior successful transfer to the receiver → positive note on the verdict |
 
-The first two rows live **on-chain** (the contract is the source of truth — it can never be downgraded). The last three are the **off-chain enrichment layer** in [`sdk/src/signals.ts`](sdk/src/signals.ts): `enrichCounterparty()` merges them with the contract verdict — **block stays block**; `allow` + any risk signal upgrades to `warn` so a human looks before signing; `warn` gains extra reasons. Every signal degrades gracefully: a missing key, a network error, a timeout or even a malformed RPC response yields a `signal unavailable` note and never a false decision (13 SDK unit tests cover exactly these paths). Wire it in with `guardedSpend(req, recipient, onWarn, { enrich })` — without the option, behavior is unchanged. Code-hash history is pluggable (`codeStore`, default in-process) so a production agent can persist observations in its own store.
+The first two rows live **on-chain** (the contract is the source of truth — it can never be downgraded). The rest are the **off-chain enrichment layer** in [`sdk/src/signals.ts`](sdk/src/signals.ts): `enrichCounterparty()` merges them with the contract verdict — **block stays block**; `allow` + any risk signal upgrades to `warn` so a human looks before signing; `warn` gains extra reasons. Every signal degrades gracefully: a missing key, a network error, a timeout or even a malformed RPC response yields a `signal unavailable` note and never a false decision (16 SDK unit tests cover exactly these paths). Wire it in with `guardedSpend(req, recipient, onWarn, { enrich })` — without the option, behavior is unchanged. Code-hash history is pluggable (`codeStore`, default in-process) so a production agent can persist observations in its own store.
+
+For security-critical deployments there is a **fail-closed mode**: `enrich: { failClosed: true }` treats an *unreachable* signal as risk (warn) instead of silently ignored — "couldn't check" should not mean "safe". Default is availability-first (`false`).
 
 ---
 
@@ -157,11 +163,21 @@ The agent NEAR account signs with a **function-call access key scoped to one con
 
 - receiver: the ShearPin contract only
 - methods: `request_signature` only
-- allowance: just enough for the MPC forwarding deposit
+- allowance: **2 NEAR, gas only** — the agent submits its spend with `deposit: 0` (see `sdk/src/index.ts`); the **contract** pays the MPC forwarding deposit from its own balance
 
-It cannot transfer NEAR, call any other contract, add keys, or delete the account. Stealing it buys the thief exactly one capability: requesting signatures that must pass every policy gate. `freeze()` (owner-only) still stops everything instantly.
+What the key cannot do: transfer NEAR, call any other contract, add/delete keys, or delete the account. Note that a NEAR function-call key *can* technically attach deposits up to its allowance — the allowance is the hard ceiling on **all** spending, and ShearPin's SDK never attaches one.
+
+**Allowance caveats** (from the [NEAR access keys docs](https://docs.near.org/protocol/accounts-contracts/access-keys) — read them):
+
+- when the allowance runs out, **the agent locks itself out**. The owner must delete the key and re-add it with a fresh allowance. Provisioning with 2 NEAR makes this a non-event; provisioning with 50 would hide the problem.
+- because the **contract pays the MPC deposit**, monitor the *contract's* balance, not the agent's. The per-day rate limit (`rate_limit_per_day`) is the upper bound on that cost.
+- an account holding only function-call keys can't transfer NEAR or add keys — it is exactly as narrow as the list above says.
 
 Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
+
+### Where the agent should run: NEAR AI Cloud + TEE attestation
+
+ShearPin assumes the **host running the LLM can be compromised** — that's what prompt injection means. The design answer is that the runtime never gets trust it can abuse: the signing authority sits behind the on-chain policy contract, and the wrapper's block/warn verdicts are re-checked on-chain (`SHEARPIN_COUNTERPARTY_BLOCKED`) even if the wrapper is bypassed. Deploying the agent on **NEAR AI Cloud** closes the remaining gap at the source: execution runs in a TEE, and the deployment's attestation can be verified per the [NEAR AI Cloud verification docs](https://docs.near.ai/cloud/verification) — so you can confirm the agent code that asked for the signature is the code you audited, not a tampered variant.
 
 ---
 
@@ -175,7 +191,7 @@ pnpm install
 
 # 2. Build the smart contract (WASM)
 cd contract
-cargo test                    # 55 unit tests, all pass
+cargo test                    # 59 unit tests, all pass
 cargo build --target wasm32-unknown-unknown --release
 # artifact: target/wasm32-unknown-unknown/release/shearpin_contract.wasm
 
@@ -219,7 +235,7 @@ node --env-file=../.env dist/demo.js   # allow → recipient deny+snap → tripp
 ## Repository Structure
 
 ```
-contract/          Rust — policy engine + Chain Signatures flow (55 unit tests)
+contract/          Rust — policy engine + Chain Signatures flow (59 unit tests)
 sdk/               TypeScript client SDK (@shearpin/sdk, 13 unit tests)
 backend/           Express REST API + SQLite ledger (audit trail)
 frontend/          React demo dashboard (breaker panel)
@@ -254,6 +270,8 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 - **EVM-only tx parsing** — the on-chain RLP decoder handles EIP-155 EVM txs; non-EVM chains via Chain Signatures would need their own payload decoders
 - **ERC-20 `transfer` only** — `transferFrom`, swaps, and other selectors are rejected fail-closed (adding selectors is a small, contained change)
 - **Not audited** — code is hackathon-grade, no formal verification or third-party audit
+- **Blocklist has no dispute path** — a false report cannot be removed on-chain (reports are immutable; that's what makes the blocklist credible). The mitigations are economic (0.01 NEAR stake per report, no refunds) and the owner-allowlist override for your own vetted counterparties — but a grieved non-allowlisted address has no on-chain appeal.
+- **Report stake is kept, not escrowed** — there is no slashing/reward cycle for correct reporting; the stake only makes spam expensive
 - **Single policy per agent** — multi-policy orchestration not implemented
 - **Owner is single NEAR account** — no multisig / DAO governance for freeze/reset
 - **No slashing / economic security** — MPC network trust is external (NEAR Chain Signatures)

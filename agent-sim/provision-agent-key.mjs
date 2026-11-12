@@ -3,14 +3,24 @@
  * the ShearPin contract only (never a full-access key).
  *
  * what this key CAN do:
- *   - call request_signature() on the ShearPin contract (with a small
- *     attached deposit allowance for the MPC forwarding fee)
+ *   - sign request_signature() calls on the ShearPin contract, spending
+ *     gas from its allowance. ShearPin's agent sends deposit 0 — the
+ *     contract pays the MPC forwarding deposit from its own balance.
+ *     (a NEAR function-call key CAN technically attach deposits up to its
+ *     allowance; the point is the allowance caps ALL spending.)
  *
  * what it CANNOT do:
  *   - call any other contract
  *   - transfer NEAR, delete the account, add/remove keys
  *   - call owner methods (freeze/reset/set_*) — those require the owner's
  *     key; the contract rejects non-owners anyway
+ *
+ * allowance caveats (see NEAR access-keys docs):
+ *   - when the allowance runs out the agent LOCKS ITSELF OUT — the owner
+ *     must delete the key and re-add it with a fresh allowance
+ *   - 2 NEAR is ample for gas-only request_signature traffic; monitor the
+ *     CONTRACT balance instead — that is who pays the MPC deposits, and
+ *     the per-day rate limit bounds that cost
  *
  * even with this key stolen, the thief can only request signatures that
  * pass every on-chain policy gate (caps, allowlists, blocklist, trip).
@@ -20,14 +30,15 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-api-js";
 import { config } from "dotenv";
+import { fileURLToPath } from "node:url";
 
-config({ path: "/opt/data/projects/ShearPin/.env" });
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 
 const AGENT_ID = process.env.SHEARPIN_AGENT_ID; // e.g. shearpin-agent-1.testnet
 const OWNER_ID = process.env.SHEARPIN_SIGNER_ID;
 const OWNER_KEY = process.env.SHEARPIN_OWNER_KEY;
 const CONTRACT = process.env.SHEARPIN_CONTRACT;
-const KEYSTORE = "/opt/data/projects/ShearPin/agent-key.json";
+const KEYSTORE = fileURLToPath(new URL("../agent-key.json", import.meta.url));
 
 if (!AGENT_ID || !CONTRACT) {
   console.error("SHEARPIN_AGENT_ID / SHEARPIN_CONTRACT must be set");
@@ -65,7 +76,8 @@ try {
         pub,
         CONTRACT,                     // receiver: ONLY the ShearPin contract
         ["request_signature"],        // methods: ONLY the policy-gated entry point
-        50n * 10n ** 24n,             // allowance: 50 NEAR for MPC deposit fees
+        2n * 10n ** 24n,              // allowance: 2 NEAR — gas only (agent sends deposit 0;
+                                      // the CONTRACT pays the MPC deposit from its balance)
       ),
     ],
   });
