@@ -7,6 +7,9 @@
  *   1. verdict on the attacker address -> BLOCK (2 evidence-backed
  *      reports on the shared blocklist) -> refuse to sign. no tx, no
  *      signature, nothing leaves the agent.
+ *   1.5 the same check goes through the off-chain signal enrichment
+ *      (account age, contract code, prior interactions) -> block stays
+ *      block; the signal reports are printed alongside.
  *   2. even if the wrapper were bypassed, the on-chain gate denies with
  *      SHEARPIN_COUNTERPARTY_BLOCKED and snaps the pin.
  *
@@ -14,8 +17,9 @@
  */
 import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-api-js";
 import { config } from "dotenv";
+import { fileURLToPath } from "node:url";
 
-config({ path: "/opt/data/projects/ShearPin/.env" });
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 
 const RPC = process.env.SHEARPIN_RPC || "https://rpc.testnet.fastnear.com";
 const OWNER = process.env.SHEARPIN_SIGNER_ID;
@@ -117,6 +121,36 @@ if (verdict.verdict === "block") {
   log("[wrapper] BLOCK -> refusing to sign. no transaction submitted, no signature requested.");
 } else {
   log("[wrapper] verdict is", verdict.verdict, "(demo expects block) — continuing to on-chain gate anyway");
+}
+
+// ---------- step 1.5: the same check through the off-chain signal enrichment ----------
+log("");
+log("[wrapper] enriching the verdict with off-chain signals (account age, contract code, prior interactions)...");
+try {
+  const { enrichCounterparty } = await import("@shearpin/sdk");
+  const enriched = await enrichCounterparty(
+    {
+      // adapter: the SDK's enrich layer only needs the checkCounterparty call
+      checkCounterparty: async (policyId, address) => {
+        const [v, r] = await view("check_counterparty", { policy_id: policyId, address });
+        return { verdict: v, reasons: r };
+      },
+    },
+    POLICY,
+    ATTACKER,
+    {
+      etherscanApiKey: process.env.ETHERSCAN_API_KEY,
+      chainId: Number(process.env.ETHERSCAN_CHAIN_ID || 11155111),
+      evmRpcUrl: process.env.SEPOLIA_RPC,
+      agentEoa: process.env.AGENT_EOA,
+    },
+  );
+  log("[signals] enriched verdict ->", enriched.verdict.toUpperCase(), "(block is never downgraded)");
+  for (const s of enriched.signals) {
+    log(`           ${s.name.padEnd(18)} ${s.risk ? "RISK" : "ok  "} ${s.value}`);
+  }
+} catch (err) {
+  log("[signals] enrichment unavailable, contract verdict stands:", err?.message ?? err);
 }
 
 // ---------- step 2: defense in depth — submit anyway, on-chain gate fires ----------

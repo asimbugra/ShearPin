@@ -135,19 +135,19 @@ report(address, category, evidence)   // evidence (URL or tx hash) is REQUIRED
 
 Reports are public, immutable, and carry their evidence — every other agent (any policy, any owner) inherits the block decision at 2+ reports. One report per reporter per address; state growth is capped.
 
-**Attack demo (live, with logs):** a prompt-injected agent is told to pay a known-bad address; the wrapper blocks, and the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`. Full log: [`docs/attack-demo.log`](docs/attack-demo.log), script: `agent-sim/attack-demo.mjs`.
+**Attack demo (live, with logs):** a prompt-injected agent is told to pay a known-bad address; the wrapper blocks, the off-chain signal reports are printed alongside (step 1.5, block is never downgraded), and the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`. Full log: [`docs/attack-demo.log`](docs/attack-demo.log), script: `agent-sim/attack-demo.mjs`.
 
-**Signals & data sources** (current + planned):
+**Signals & data sources:**
 
 | Signal | Source | How |
 |---|---|---|
 | Shared blocklist reports | ShearPin contract state | `check_counterparty` / `get_reports` view calls — on-chain, free |
 | Recipient vetted by owner | Policy `allowed_recipients` | same view call; absence → warn |
-| Account age & activity (planned) | Etherscan/Blockscout API, NEAR indexer | first-tx timestamp, tx count, nonce velocity |
-| Contract vs EOA + recent code change (planned) | `eth_getCode` + code-hash history | any diff within N days → warn |
-| Prior interactions (planned) | agent EOA tx history | prior successful transfer to the receiver lowers the score |
+| Account age & activity | Etherscan V2 API (`ETHERSCAN_API_KEY`) | first-tx timestamp (`txlist` asc) → `< 7 days old` warns; last 25 txs → `low activity` warns |
+| Contract vs EOA + code change | `eth_getCode` via `SEPOLIA_RPC` | `"0x"` → EOA; contract code hash compared against the last observation — any change → warn |
+| Prior interactions | agent EOA `txlist` (`AGENT_EOA`) | prior successful transfer to the receiver → positive note on the verdict |
 
-The first two rows ship today; the rest are additive to `check_counterparty` and require no contract change (the verdict logic already merges multiple reasons).
+The first two rows live **on-chain** (the contract is the source of truth — it can never be downgraded). The last three are the **off-chain enrichment layer** in [`sdk/src/signals.ts`](sdk/src/signals.ts): `enrichCounterparty()` merges them with the contract verdict — **block stays block**; `allow` + any risk signal upgrades to `warn` so a human looks before signing; `warn` gains extra reasons. Every signal degrades gracefully: a missing key, a network error, a timeout or even a malformed RPC response yields a `signal unavailable` note and never a false decision (13 SDK unit tests cover exactly these paths). Wire it in with `guardedSpend(req, recipient, onWarn, { enrich })` — without the option, behavior is unchanged. Code-hash history is pluggable (`codeStore`, default in-process) so a production agent can persist observations in its own store.
 
 ---
 
@@ -220,7 +220,7 @@ node --env-file=../.env dist/demo.js   # allow → recipient deny+snap → tripp
 
 ```
 contract/          Rust — policy engine + Chain Signatures flow (55 unit tests)
-sdk/               TypeScript client SDK (@shearpin/sdk)
+sdk/               TypeScript client SDK (@shearpin/sdk, 13 unit tests)
 backend/           Express REST API + SQLite ledger (audit trail)
 frontend/          React demo dashboard (breaker panel)
 agent-sim/         Demo / setup / deploy / reset scripts (live testnet)

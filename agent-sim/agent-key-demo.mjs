@@ -2,9 +2,10 @@
 import { readFileSync } from "node:fs";
 import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-api-js";
 import { config } from "dotenv";
-config({ path: "/opt/data/projects/ShearPin/.env" });
+import { fileURLToPath } from "node:url";
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 const provider = new JsonRpcProvider({ url: "https://rpc.testnet.fastnear.com" });
-const keyJson = JSON.parse(readFileSync("/opt/data/projects/ShearPin/agent-key.json", "utf8"));
+const keyJson = JSON.parse(readFileSync(fileURLToPath(new URL("../agent-key.json", import.meta.url)), "utf8"));
 const agent = new Account(keyJson.account_id, provider, new KeyPairSigner(KeyPair.fromString(keyJson.secret_key)));
 console.log("signing as:", keyJson.account_id, "(function-call key only)");
 

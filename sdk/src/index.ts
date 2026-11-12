@@ -23,6 +23,11 @@ import { JsonRpcProvider } from "@near-js/providers";
 import { KeyPairSigner } from "@near-js/signers";
 import { Account, JsonRpcProvider as NajProvider, KeyPairSigner as NajKeyPairSigner, actions as najActions } from "near-api-js";
 import { ethers } from "ethers";
+import { enrichCounterparty } from "./signals.js";
+import type { SignalOptions } from "./signals.js";
+
+export type { SignalOptions, SignalReport, EnrichedVerdict, CodeStore } from "./signals.js";
+export { enrichCounterparty } from "./signals.js";
 
 export type KeyType = "ecdsa" | "eddsa";
 
@@ -147,16 +152,20 @@ export class ShearPinClient {
    * asks a human when it is warn (onWarn must resolve true to proceed).
    * only an allow verdict (or an approved warn) reaches requestSpend —
    * where the on-chain gates check everything again.
+   *
+   * opts.enrich (signals.ts): when given, the contract verdict is merged
+   * with off-chain signals (account age, contract code change, prior
+   * interactions) — risk signals upgrade allow to warn so a human looks.
    */
   async guardedSpend(
     req: SpendRequest,
     recipient: string,
     onWarn: (reasons: string[]) => Promise<boolean>,
+    opts?: { enrich?: SignalOptions },
   ): Promise<SpendOutcome | { kind: "refused"; verdict: string; reasons: string[] }> {
-    const { verdict, reasons } = await this.checkCounterparty(
-      req.policyId,
-      recipient,
-    );
+    const { verdict, reasons } = opts?.enrich
+      ? await enrichCounterparty(this, req.policyId, recipient, opts.enrich)
+      : await this.checkCounterparty(req.policyId, recipient);
     if (verdict === "block") {
       return { kind: "refused", verdict, reasons };
     }
