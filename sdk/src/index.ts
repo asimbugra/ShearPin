@@ -121,10 +121,15 @@ export class ShearPinClient {
     policyId: string,
     address: string,
   ): Promise<{ verdict: "allow" | "warn" | "block"; reasons: string[] }> {
-    return this.callView("check_counterparty", {
-      policy_id: policyId,
-      address,
-    });
+    const raw = await this.callView<unknown>(
+      "check_counterparty",
+      { policy_id: policyId, address },
+    );
+    // the contract returns a Rust tuple [verdict, reasons]; accept both shapes
+    if (Array.isArray(raw)) {
+      return { verdict: raw[0] as "allow" | "warn" | "block", reasons: (raw[1] as string[]) ?? [] };
+    }
+    return raw as { verdict: "allow" | "warn" | "block"; reasons: string[] };
   }
 
   /** report a bad counterparty to the shared blocklist (evidence required;
@@ -162,7 +167,7 @@ export class ShearPinClient {
     req: SpendRequest,
     recipient: string,
     onWarn: (reasons: string[]) => Promise<boolean>,
-    opts?: { enrich?: SignalOptions },
+    opts?: { enrich?: SignalOptions; autoAllowApproved?: boolean },
   ): Promise<SpendOutcome | { kind: "refused"; verdict: string; reasons: string[] }> {
     const { verdict, reasons } = opts?.enrich
       ? await enrichCounterparty(this, req.policyId, recipient, opts.enrich)
@@ -175,8 +180,39 @@ export class ShearPinClient {
       if (!approved) {
         return { kind: "refused", verdict, reasons };
       }
+      // the approving human IS the owner — vetting by approval means the
+      // recipient joins the policy allowlist, otherwise the on-chain
+      // recipient allowlist gate would deny the very spend the human just
+      // approved (and snap the pin). requires the client to be constructed
+      // with the OWNER key for this call (the agent key cannot call
+      // owner methods).
+      if (opts?.autoAllowApproved) {
+        await this.addAllowedRecipient(req.policyId, recipient);
+      }
     }
     return this.requestSpend(req);
+  }
+
+  /**
+   * owner only: add a recipient to the policy allowlist (union with the
+   * existing entries). used by guardedSpend({ autoAllowApproved }) so a
+   * human-approved warn can actually complete on-chain.
+   */
+  async addAllowedRecipient(policyId: string, recipient: string): Promise<void> {
+    const policy = await this.getPolicy(policyId);
+    const current: string[] = policy.allowed_recipients ?? [];
+    const next = [...new Set([...current, recipient.trim().toLowerCase()])];
+    await this.account.signAndSendTransaction({
+      receiverId: this.cfg.contractId,
+      actions: [
+        najActions.functionCall(
+          "set_allowed_recipients",
+          { policy_id: policyId, recipients: next },
+          BigInt(100) * TGAS,
+          0n,
+        ),
+      ],
+    });
   }
 
   /**

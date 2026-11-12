@@ -19,15 +19,17 @@ import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-
 import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
 
-config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)), quiet: true });
 
 const RPC = process.env.SHEARPIN_RPC || "https://rpc.testnet.fastnear.com";
 const OWNER = process.env.SHEARPIN_SIGNER_ID;
-const CONTRACT = process.env.SHEARPIN_CONTRACT || "v3.shearpin-owner-1.testnet";
+const CONTRACT = process.env.SHEARPIN_CONTRACT || "v1.shearpin-owner-2.testnet";
 const POLICY = process.env.SHEARPIN_POLICY || "sat1";
 const SEPOLIA = 11155111n;
 
-// the "known-bad address": two independent agents already reported it
+// the "known-bad address": 0xdEaD is the canonical burn address, used here
+// as a stand-in. reports on it are DEMO EVIDENCE (labeled as such), not
+// real drainer claims — swap in a real address + evidence for production.
 const ATTACKER = "0x000000000000000000000000000000000000dEaD";
 // a second reporter account so the blocklist reaches the block threshold
 const REPORTER2 = process.env.SHEARPIN_REPORTER2_ID || "shearpin-reporter-2.testnet";
@@ -82,7 +84,7 @@ if (reports.length === 0) {
   log("[setup] reporting attacker (agent 1 of 2)...");
   await owner.signAndSendTransaction({
     receiverId: CONTRACT,
-    actions: [actions.functionCall("report", { address: ATTACKER, category: "drainer", evidence: "sepolia:0xa3cf0383e326b752c0198150284a36abc8ce27a261a3e4b9c3dc9846076448d0" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
+    actions: [actions.functionCall("report", { address: ATTACKER, category: "drainer", evidence: "demo-evidence: 0xdEaD is the canonical burn address (example report for this demo — not a real drainer claim)" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
   });
   reports = await view("get_reports", { address: ATTACKER });
 }
@@ -101,7 +103,7 @@ if (reports.length < 2) {
     log("[setup] reporting attacker (agent 2 of 2) from", REPORTER2);
     await rep2.signAndSendTransaction({
       receiverId: CONTRACT,
-      actions: [actions.functionCall("report", { address: ATTACKER, category: "phishing", evidence: "https://etherscan.io/address/0x000000000000000000000000000000000000dEaD" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
+      actions: [actions.functionCall("report", { address: ATTACKER, category: "phishing", evidence: "demo-evidence: example report for this demo — not a real phishing claim" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
     });
   } else {
     log(`[setup] WARNING: no second reporter account (${REPORTER2}); the demo needs 2 reports to block`);
@@ -116,6 +118,7 @@ for (let i = 0; i < 15; i++) {
   await new Promise((r) => setTimeout(r, 2000));
 }
 log(`[setup] ${reports.length} report(s) on-chain:`, reports.map((r) => `${r.reporter}:${r.category}`));
+log("[setup] NOTE: the on-chain report evidence for", ATTACKER, "is example/demo data — 0xdEaD is the canonical burn address, not a real drainer claim");
 
 // ---------- step 1: the wrapper check (what the agent sees) ----------
 log("");
@@ -148,6 +151,8 @@ try {
     ATTACKER,
     {
       etherscanApiKey: process.env.ETHERSCAN_API_KEY,
+      // any Etherscan-V2-compatible endpoint works; Blockscout needs no key
+      etherscanApiUrl: process.env.ETHERSCAN_API_URL || "https://api.etherscan.io/v2/api",
       chainId: Number(process.env.ETHERSCAN_CHAIN_ID || 11155111),
       evmRpcUrl: process.env.SEPOLIA_RPC,
       agentEoa: process.env.AGENT_EOA,

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-api-js";
 import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
-config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)), quiet: true });
 const provider = new JsonRpcProvider({ url: "https://rpc.testnet.fastnear.com" });
 const CONTRACT = process.env.SHEARPIN_CONTRACT || "v1.shearpin-owner-2.testnet";
 const POLICY = process.env.SHEARPIN_POLICY || "sat1";

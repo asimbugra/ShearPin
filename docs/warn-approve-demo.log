@@ -1,0 +1,15 @@
+=== ShearPin warn-approve demo: human approval closes the loop ===
+
+[agent] task: pay 0.001 ETH to a NEW vendor 0xd8f382ed0abf98c3d3d325a4e6c78389aab7aaaa
+[wrapper] counterparty check -> WARN
+           reason: not in the policy recipient allowlist (unvetted)
+
+[human] approving the payment (owner decision)...
+[human] reasons shown: not in the policy recipient allowlist (unvetted)
+
+[wrapper] spend verdict -> ALLOW 
+[wrapper] near tx: QnvgMuah3DPJJePVoYvfaKV2HBXmFYspyW3Zg9ZZZco
+[wrapper] counterparty check now -> ALLOW (the approved vendor is allowlisted)
+[chain]   allowlist now has 3 entries
+
+WARN-APPROVE END-TO-END: PASS

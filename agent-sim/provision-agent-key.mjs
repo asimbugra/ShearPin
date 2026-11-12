@@ -6,8 +6,9 @@
  *   - sign request_signature() calls on the ShearPin contract, spending
  *     gas from its allowance. ShearPin's agent sends deposit 0 — the
  *     contract pays the MPC forwarding deposit from its own balance.
- *     (a NEAR function-call key CAN technically attach deposits up to its
- *     allowance; the point is the allowance caps ALL spending.)
+ *     (function-call keys CANNOT attach deposits at all — the NEAR
+ *     protocol rejects that with DepositWithFunctionCall — so the
+ *     allowance only ever pays gas.)
  *
  * what it CANNOT do:
  *   - call any other contract
@@ -32,7 +33,7 @@ import { Account, JsonRpcProvider, KeyPair, KeyPairSigner, actions } from "near-
 import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
 
-config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
+config({ path: fileURLToPath(new URL("../.env", import.meta.url)), quiet: true });
 
 const AGENT_ID = process.env.SHEARPIN_AGENT_ID; // e.g. shearpin-agent-1.testnet
 const OWNER_ID = process.env.SHEARPIN_SIGNER_ID;

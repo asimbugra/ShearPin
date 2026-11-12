@@ -125,7 +125,7 @@ check_counterparty(policy_id, address) -> verdict + reasons
 ```
 
 - **block** — the address has ≥2 evidence-backed reports on the shared blocklist **and is not in this policy's recipient allowlist**. The wrapper **refuses to sign** (no tx is ever submitted), and the on-chain gate enforces the same verdict (`SHEARPIN_COUNTERPARTY_BLOCKED`, pin snaps) even if the wrapper is bypassed entirely.
-- **warn** — something deserves a human look: a single report exists, the address is not in the policy's allowlist (unvetted), or reports exist on an **owner-allowlisted** address. The wrapper calls its `onWarn` hook and only proceeds on explicit human approval.
+- **warn** — something deserves a human look: a single report exists, the address is not in the policy's allowlist (unvetted), or reports exist on an **owner-allowlisted** address. The wrapper calls its `onWarn` hook and only proceeds on explicit human approval. Approval **closes the loop**: with `guardedSpend(req, to, onWarn, { autoAllowApproved: true })` the approving owner's key adds the recipient to the policy allowlist first (`set_allowed_recipients`) — otherwise the on-chain recipient gate would deny the very spend the human just approved. Vet-by-approval, then pay. Live demo: [`docs/warn-approve-demo.log`](docs/warn-approve-demo.log).
 - **allow** — allowlisted with zero reports.
 
 **Why allowlisted addresses only warn.** `report()` is permissionless by design — but that makes it a Sybil target: two free testnet accounts could hard-block your real supplier and snap the pin (a DoS). The defense is ownership: **an address the owner explicitly allowlisted can never be counterparty-blocked** — reports only warn, and the owner re-vets by removing the allowlist entry if the reports are credible. Everyone else's blocklist verdict is unchanged.
@@ -165,7 +165,7 @@ The agent NEAR account signs with a **function-call access key scoped to one con
 - methods: `request_signature` only
 - allowance: **2 NEAR, gas only** — the agent submits its spend with `deposit: 0` (see `sdk/src/index.ts`); the **contract** pays the MPC forwarding deposit from its own balance
 
-What the key cannot do: transfer NEAR, call any other contract, add/delete keys, or delete the account. Note that a NEAR function-call key *can* technically attach deposits up to its allowance — the allowance is the hard ceiling on **all** spending, and ShearPin's SDK never attaches one.
+What the key cannot do: transfer NEAR, call any other contract, add/delete keys, or delete the account — **or attach deposits at all**. The NEAR protocol rejects a deposit on a function-call-key call (`DepositWithFunctionCall`), so the allowance pays gas only. ShearPin's agent submits its spend with `deposit: 0` (see `sdk/src/index.ts`); the **contract** pays the MPC forwarding deposit from its own balance.
 
 **Allowance caveats** (from the [NEAR access keys docs](https://docs.near.org/protocol/accounts-contracts/access-keys) — read them):
 
@@ -175,7 +175,7 @@ What the key cannot do: transfer NEAR, call any other contract, add/delete keys,
 
 Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
 
-### Where the agent should run: NEAR AI Cloud + TEE attestation
+### Where the agent should run: NEAR AI Cloud + TEE attestation (recommended deployment — not part of this demo)
 
 ShearPin assumes the **host running the LLM can be compromised** — that's what prompt injection means. The design answer is that the runtime never gets trust it can abuse: the signing authority sits behind the on-chain policy contract, and the wrapper's block/warn verdicts are re-checked on-chain (`SHEARPIN_COUNTERPARTY_BLOCKED`) even if the wrapper is bypassed. Deploying the agent on **NEAR AI Cloud** closes the remaining gap at the source: execution runs in a TEE, and the deployment's attestation can be verified per the [NEAR AI Cloud verification docs](https://docs.near.ai/cloud/verification) — so you can confirm the agent code that asked for the signature is the code you audited, not a tampered variant.
 
@@ -265,6 +265,7 @@ Committed logs, captured live on 2026-11-13:
 - **[`docs/live-demo.log`](docs/live-demo.log)** — 4-scene demo: in-policy spend **allowed + MPC signature** (~7 s), prompt-injected over-limit payment → `SHEARPIN_RECIPIENT`, pin snaps and **stays tripped** (`SHEARPIN_TRIPPED` on a tiny spend), mainnet-chainId tx → `SHEARPIN_CHAIN`
 - **[`docs/attack-demo.log`](docs/attack-demo.log)** — the security story: 2 evidence-backed blocklist reports (owner + an independent reporter, each with the 0.01 NEAR stake) → wrapper verdict **BLOCK → refuses to sign**; the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`; the enrichment layer reports EOA detection alongside
 - **[`docs/agent-key-demo.log`](docs/agent-key-demo.log)** — the agent account (`sat1-agent.shearpin-owner-2.testnet`) holds **only a function-call key** scoped to `request_signature`; it passes the counterparty check (`allow`) and receives an MPC signature (`signature_ok: YES`)
+- **[`docs/warn-approve-demo.log`](docs/warn-approve-demo.log)** — the human-approval loop, closed: unvetted recipient → wrapper **WARN** → the human approves → the owner key adds the recipient to the allowlist → the spend is **allowed** (`SHEARPIN_COUNTERPARTY_BLOCKED` would have fired instead if the address had 2+ reports — the two gates are complementary: the blocklist carries *shared* knowledge across every policy, the allowlist carries *this owner's* vetting)
 
 Earlier proof from the previous `v3` deployment: a [real Sepolia tx](https://sepolia.etherscan.io/tx/0xf88b69bb83d63d02d445a9a6e5d69bceb514ec3a84b275462c14ffde16abc559) — policy-checked on NEAR, MPC-signed, broadcast to Sepolia (`0x33de51b35230a265F48D114e4d923432c597eCb4`, derived from path `shearpin/sat1/eth/0`).
 

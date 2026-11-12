@@ -122,3 +122,104 @@ describe("reportCounterparty attaches the anti-Sybil stake", () => {
     expect(action.deposit).toBe(10n ** 22n); // REPORT_DEPOSIT
   });
 });
+
+describe("guardedSpend closes the loop on human-approved warn (solution A)", () => {
+  function warnStub() {
+    let spendCalls = 0;
+    const txs: Array<{ method: string; args: Record<string, unknown> }> = [];
+    return {
+      spendCalls: () => spendCalls,
+      txs,
+      cfg: { contractId: "test.near" },
+      addAllowedRecipient: ShearPinClient.prototype.addAllowedRecipient,
+      checkCounterparty: async () => ({
+        verdict: "warn" as const,
+        reasons: ["not in the policy recipient allowlist (unvetted)"],
+      }),
+      getPolicy: async () => ({ allowed_recipients: ["0xd4e56740f876afec8011e179a8b763074e6b5c8f"] }),
+      requestSpend: async () => {
+        spendCalls++;
+        return { verdict: "allow" as const };
+      },
+      account: {
+        signAndSendTransaction: async (args: {
+          actions: Array<{ functionCall: { methodName: string; args: Record<string, unknown> } }>;
+        }) => {
+          const fc = args.actions[0].functionCall;
+          // near-api-js serializes args to bytes immediately — decode back
+          const raw = fc.args as unknown;
+          const decoded =
+            raw instanceof Uint8Array
+              ? (JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>)
+              : (raw as Record<string, unknown>);
+          txs.push({ method: fc.methodName, args: decoded });
+          return {};
+        },
+      },
+    };
+  }
+
+  it("autoAllowApproved: adds the approved recipient to the allowlist before spending", async () => {
+    const stub = warnStub();
+    const out = await ShearPinClient.prototype.guardedSpend.call(
+      stub as never,
+      req,
+      "0xnew000000000000000000000000000000000000",
+      async () => true, // the human approves
+      { autoAllowApproved: true },
+    );
+    expect(out).toMatchObject({ verdict: "allow" });
+    expect(stub.spendCalls()).toBe(1);
+    const call = stub.txs.find((t) => t.method === "set_allowed_recipients");
+    expect(call).toBeTruthy();
+    expect((call!.args.recipients as string[]).map((r) => r.toLowerCase())).toContain(
+      "0xnew000000000000000000000000000000000000",
+    );
+    // the existing vendor entry survives (union, not replace)
+    expect((call!.args.recipients as string[]).length).toBe(2);
+  });
+
+  it("without autoAllowApproved an approved warn still proceeds (old behavior)", async () => {
+    const stub = warnStub();
+    const out = await ShearPinClient.prototype.guardedSpend.call(
+      stub as never,
+      req,
+      "0xnew000000000000000000000000000000000000",
+      async () => true,
+    );
+    expect(out).toMatchObject({ verdict: "allow" });
+    expect(stub.txs.find((t) => t.method === "set_allowed_recipients")).toBeUndefined();
+  });
+
+  it("a refused warn never touches the allowlist", async () => {
+    const stub = warnStub();
+    const out = await ShearPinClient.prototype.guardedSpend.call(
+      stub as never,
+      req,
+      "0xnew000000000000000000000000000000000000",
+      async () => false, // the human declines
+      { autoAllowApproved: true },
+    );
+    expect(out).toMatchObject({ kind: "refused", verdict: "warn" });
+    expect(stub.spendCalls()).toBe(0);
+    expect(stub.txs.find((t) => t.method === "set_allowed_recipients")).toBeUndefined();
+  });
+});
+
+describe("checkCounterparty normalizes the contract tuple", () => {
+  it("maps the contract's [verdict, reasons] tuple to { verdict, reasons }", async () => {
+    const stub = {
+      callView: async () => ["warn", ["not in the policy recipient allowlist (unvetted)"]],
+    };
+    const out = await ShearPinClient.prototype.checkCounterparty.call(stub as never, "sat1", "0xabc");
+    expect(out).toEqual({ verdict: "warn", reasons: ["not in the policy recipient allowlist (unvetted)"] });
+  });
+
+  it("passes through an already-normalized object", async () => {
+    const stub = {
+      callView: async () => ({ verdict: "block", reasons: ["reported"] }),
+    };
+    const out = await ShearPinClient.prototype.checkCounterparty.call(stub as never, "sat1", "0xabc");
+    expect(out).toEqual({ verdict: "block", reasons: ["reported"] });
+  });
+});
