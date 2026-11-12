@@ -167,7 +167,13 @@ export class ShearPinClient {
     req: SpendRequest,
     recipient: string,
     onWarn: (reasons: string[]) => Promise<boolean>,
-    opts?: { enrich?: SignalOptions; autoAllowApproved?: boolean },
+    opts?: {
+      enrich?: SignalOptions;
+      autoAllowApproved?: boolean;
+      /** a client built with the OWNER key — signs set_allowed_recipients
+       *  on an approved warn. never put the owner key on the agent runtime. */
+      ownerClient?: ShearPinClient;
+    },
   ): Promise<SpendOutcome | { kind: "refused"; verdict: string; reasons: string[] }> {
     const { verdict, reasons } = opts?.enrich
       ? await enrichCounterparty(this, req.policyId, recipient, opts.enrich)
@@ -183,11 +189,13 @@ export class ShearPinClient {
       // the approving human IS the owner — vetting by approval means the
       // recipient joins the policy allowlist, otherwise the on-chain
       // recipient allowlist gate would deny the very spend the human just
-      // approved (and snap the pin). requires the client to be constructed
-      // with the OWNER key for this call (the agent key cannot call
-      // owner methods).
+      // approved (and snap the pin). pass ownerClient (a client built with
+      // the OWNER key) so the OWNER signs set_allowed_recipients — the
+      // agent's function-call key can't (methods: request_signature only),
+      // and an owner key on the agent runtime would defeat the whole model.
       if (opts?.autoAllowApproved) {
-        await this.addAllowedRecipient(req.policyId, recipient);
+        const vetting = opts.ownerClient ?? this;
+        await vetting.addAllowedRecipient(req.policyId, recipient);
       }
     }
     return this.requestSpend(req);
@@ -235,7 +243,9 @@ export class ShearPinClient {
               payload: Array.from(req.payload),
             },
             BigInt(300) * TGAS,
-            1n
+            0n // MUST be 0: function-call keys cannot attach ANY deposit
+               // (protocol rejects it — DepositWithFunctionCall). the
+               // contract pays the MPC forwarding deposit from its balance.
           ),
         ],
       }) as unknown as {

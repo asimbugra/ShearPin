@@ -21,7 +21,7 @@
 [signals] enriched verdict -> BLOCK (block is never downgraded)
            account-age        ok   first seen 2022-07-02 (1594.8d old) · 25 recent txs
            contract           ok   EOA (no code)
-           prior-interactions ok   unavailable
+           prior-interactions ok   no prior transfers to this agent
 
 [agent] (defense-in-depth) submitting the spend anyway to show the on-chain gate...
 [chain]  deny event: {"event":"deny","policy":"sat1","reason":"counterparty_blocked","amount":5000000000000000000,"recipient":"0x000000000000000000000000000000000000dead","chain_id":11155111}

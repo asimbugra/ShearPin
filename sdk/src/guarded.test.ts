@@ -123,35 +123,35 @@ describe("reportCounterparty attaches the anti-Sybil stake", () => {
   });
 });
 
-describe("guardedSpend closes the loop on human-approved warn (solution A)", () => {
-  function warnStub() {
-    let spendCalls = 0;
-    const txs: Array<{ method: string; args: Record<string, unknown> }> = [];
-    return {
-      spendCalls: () => spendCalls,
-      txs,
-      cfg: { contractId: "test.near" },
-      addAllowedRecipient: ShearPinClient.prototype.addAllowedRecipient,
-      checkCounterparty: async () => ({
-        verdict: "warn" as const,
-        reasons: ["not in the policy recipient allowlist (unvetted)"],
-      }),
-      getPolicy: async () => ({ allowed_recipients: ["0xd4e56740f876afec8011e179a8b763074e6b5c8f"] }),
-      requestSpend: async () => {
-        spendCalls++;
-        return { verdict: "allow" as const };
-      },
-      account: {
-        signAndSendTransaction: async (args: {
-          actions: Array<{ functionCall: { methodName: string; args: Record<string, unknown> } }>;
-        }) => {
-          const fc = args.actions[0].functionCall;
-          // near-api-js serializes args to bytes immediately — decode back
-          const raw = fc.args as unknown;
-          const decoded =
-            raw instanceof Uint8Array
-              ? (JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>)
-              : (raw as Record<string, unknown>);
+/** FC-key agent stub: warns on unvetted recipients, captures owner-method attempts */
+function warnStub() {
+  let spendCalls = 0;
+  const txs: Array<{ method: string; args: Record<string, unknown> }> = [];
+  return {
+    spendCalls: () => spendCalls,
+    txs,
+    cfg: { contractId: "test.near" },
+    addAllowedRecipient: ShearPinClient.prototype.addAllowedRecipient,
+    checkCounterparty: async () => ({
+      verdict: "warn" as const,
+      reasons: ["not in the policy recipient allowlist (unvetted)"],
+    }),
+    getPolicy: async () => ({ allowed_recipients: ["0xd4e56740f876afec8011e179a8b763074e6b5c8f"] }),
+    requestSpend: async () => {
+      spendCalls++;
+      return { verdict: "allow" as const };
+    },
+    account: {
+      signAndSendTransaction: async (args: {
+        actions: Array<{ functionCall: { methodName: string; args: Record<string, unknown> } }>;
+      }) => {
+        const fc = args.actions[0].functionCall;
+        // near-api-js serializes args to bytes immediately — decode back
+        const raw = fc.args as unknown;
+        const decoded =
+          raw instanceof Uint8Array
+            ? (JSON.parse(Buffer.from(raw).toString("utf8")) as Record<string, unknown>)
+            : (raw as Record<string, unknown>);
           txs.push({ method: fc.methodName, args: decoded });
           return {};
         },
@@ -159,6 +159,7 @@ describe("guardedSpend closes the loop on human-approved warn (solution A)", () 
     };
   }
 
+describe("guardedSpend closes the loop on human-approved warn (solution A)", () => {
   it("autoAllowApproved: adds the approved recipient to the allowlist before spending", async () => {
     const stub = warnStub();
     const out = await ShearPinClient.prototype.guardedSpend.call(
@@ -221,5 +222,60 @@ describe("checkCounterparty normalizes the contract tuple", () => {
     };
     const out = await ShearPinClient.prototype.checkCounterparty.call(stub as never, "sat1", "0xabc");
     expect(out).toEqual({ verdict: "block", reasons: ["reported"] });
+  });
+});
+
+describe("role separation: the agent key must never sign an owner write", () => {
+  it("autoAllowApproved uses ownerClient for the allowlisting, not the agent client", async () => {
+    const stub = warnStub(); // agent-side: FC-key client
+    let ownerVets = 0;
+    const ownerClient = {
+      addAllowedRecipient: async (_policyId: string, recipient: string) => {
+        ownerVets++;
+        return recipient;
+      },
+    };
+    const out = await ShearPinClient.prototype.guardedSpend.call(
+      stub as never,
+      req,
+      "0xnew000000000000000000000000000000000000",
+      async () => true, // human approves
+      { autoAllowApproved: true, ownerClient: ownerClient as never },
+    );
+    expect(out).toMatchObject({ verdict: "allow" });
+    expect(stub.spendCalls()).toBe(1); // agent submitted the spend
+    expect(ownerVets).toBe(1); // owner signed the vetting
+    // the agent client itself never touched set_allowed_recipients —
+    // its FC key couldn't anyway (methods: request_signature only)
+    expect(stub.txs.find((t) => t.method === "set_allowed_recipients")).toBeUndefined();
+  });
+});
+
+describe("requestSpend is function-call-key compatible", () => {
+  it("attaches ZERO deposit — the protocol rejects any deposit on an FC-key call", async () => {
+    let captured: { actions: Array<{ functionCall: { deposit: bigint; methodName: string } }> } | null = null;
+    const stub = {
+      cfg: { contractId: "test.near" },
+      account: {
+        signAndSendTransaction: async (args: never) => {
+          captured = args as never;
+          return {
+            transaction: { hash: "0x1" },
+            transaction_outcome: { outcome: { logs: [] } },
+            receipts_outcome: [],
+            status: { SuccessValue: null },
+          };
+        },
+      },
+    };
+    await ShearPinClient.prototype.requestSpend.call(stub as never, {
+      policyId: "sat1",
+      derivationPath: "eth/0",
+      keyType: "ecdsa",
+      payload: new Uint8Array([1, 2, 3]),
+    });
+    const action = (captured as never as { actions: Array<{ functionCall: { deposit: bigint; methodName: string } }> }).actions[0].functionCall;
+    expect(action.methodName).toBe("request_signature");
+    expect(action.deposit).toBe(0n); // DepositWithFunctionCall otherwise
   });
 });

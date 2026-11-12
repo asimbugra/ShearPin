@@ -1,15 +1,19 @@
-=== ShearPin warn-approve demo: human approval closes the loop ===
+=== ShearPin warn-approve demo: human approval closes the loop (two-key role separation) ===
 
-[agent] task: pay 0.001 ETH to a NEW vendor 0xd8f382ed0abf98c3d3d325a4e6c78389aab7aaaa
+[keys]  agent: sat1-agent.shearpin-owner-2.testnet (function-call key)
+[keys]  owner: shearpin-owner-2.testnet (signs owner writes ONLY here)
+
+[agent] task: pay 0.001 ETH to a NEW vendor 0x2c365339837e5b40d73fb5419dbb8665bfa229b7
 [wrapper] counterparty check -> WARN
            reason: not in the policy recipient allowlist (unvetted)
 
 [human] approving the payment (owner decision)...
 [human] reasons shown: not in the policy recipient allowlist (unvetted)
 
-[wrapper] spend verdict -> ALLOW 
-[wrapper] near tx: QnvgMuah3DPJJePVoYvfaKV2HBXmFYspyW3Zg9ZZZco
+[human] owner signs set_allowed_recipients (agent key can't)
+[agent] spend via function-call key -> ALLOW 
+[agent] near tx: 9yvz6kq7PJwMsdUkPWWAbr15FnJn8CDzS2uk7ZsMAx1T
 [wrapper] counterparty check now -> ALLOW (the approved vendor is allowlisted)
-[chain]   allowlist now has 3 entries
+[chain]   allowlist now has 5 entries
 
 WARN-APPROVE END-TO-END: PASS
