@@ -1,0 +1,7 @@
+[init] policy sat1: max_tx=10000000000000000 daily=100000000000000000 chains=[11155111] recipients=1
+[s1] allow  (7013ms) near=2crvMYqNYR8KwYFDhXudLNX9SCPaDDLE86NoVQRZnqxC
+[s2] deny SHEARPIN_RECIPIENT
+[s3] deny SHEARPIN_TRIPPED: tripped
+[s4] deny SHEARPIN_CHAIN
+[end] policy status: tripped
+DEMO PASSED — all four scenes verified

@@ -4,7 +4,7 @@
 
 > A shear pin is the mechanical safety device that snaps when torque exceeds the limit — the machine survives. ShearPin does the same for agent wallets: when a spend exceeds policy, the signature is refused. The agent survives; your funds survive.
 
-**Live on NEAR testnet:** `v3.shearpin-owner-1.testnet`  
+**Live on NEAR testnet:** `v1.shearpin-owner-2.testnet`  
 **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
 ---
@@ -247,7 +247,7 @@ scripts/gen-keys.js  One-time keypair generator for testnet accounts
 
 ## Measured Performance (live testnet)
 
-Measured on `v3.shearpin-owner-1.testnet` (NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`.
+Measured on the previous `v3.shearpin-owner-1.testnet` deployment (same gate pipeline, NEAR testnet, MPC `v1.signer-prod.testnet`) — raw data in `bench_results.json`, script in `agent-sim/bench2.mjs`. The current deployment reproduces the allow path at ~7.0 s (see `docs/live-demo.log`).
 
 | Path | What happens | Latency | Gas |
 |---|---|---|---|
@@ -258,11 +258,15 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 
 ---
 
-## Live Proof
+## Live Proof (current deployment: `v1.shearpin-owner-2.testnet`)
 
-- **On-chain policy verification:** 7-scene demo (allow → recipient deny+snap → tripped containment → chainId deny → ERC-20 calldata recipient deny → **unknown-token deny** → **gas-price-over-cap deny**) executed live against `v3.shearpin-owner-1.testnet`
-- **MPC signature + Sepolia broadcast:** [Real Sepolia tx](https://sepolia.etherscan.io/tx/0xf88b69bb83d63d02d445a9a6e5d69bceb514ec3a84b275462c14ffde16abc559) signed via NEAR Chain Signatures, policy-checked on NEAR, broadcast to Sepolia
-- **Agent address:** `0x33de51b35230a265F48D114e4d923432c597eCb4` (deterministically derived from path `shearpin/sat1/eth/0`)
+Committed logs, captured live on 2026-11-13:
+
+- **[`docs/live-demo.log`](docs/live-demo.log)** — 4-scene demo: in-policy spend **allowed + MPC signature** (~7 s), prompt-injected over-limit payment → `SHEARPIN_RECIPIENT`, pin snaps and **stays tripped** (`SHEARPIN_TRIPPED` on a tiny spend), mainnet-chainId tx → `SHEARPIN_CHAIN`
+- **[`docs/attack-demo.log`](docs/attack-demo.log)** — the security story: 2 evidence-backed blocklist reports (owner + an independent reporter, each with the 0.01 NEAR stake) → wrapper verdict **BLOCK → refuses to sign**; the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`; the enrichment layer reports EOA detection alongside
+- **[`docs/agent-key-demo.log`](docs/agent-key-demo.log)** — the agent account (`sat1-agent.shearpin-owner-2.testnet`) holds **only a function-call key** scoped to `request_signature`; it passes the counterparty check (`allow`) and receives an MPC signature (`signature_ok: YES`)
+
+Earlier proof from the previous `v3` deployment: a [real Sepolia tx](https://sepolia.etherscan.io/tx/0xf88b69bb83d63d02d445a9a6e5d69bceb514ec3a84b275462c14ffde16abc559) — policy-checked on NEAR, MPC-signed, broadcast to Sepolia (`0x33de51b35230a265F48D114e4d923432c597eCb4`, derived from path `shearpin/sat1/eth/0`).
 
 ## Limitations (Honest)
 

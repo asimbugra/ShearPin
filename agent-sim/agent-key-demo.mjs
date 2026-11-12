@@ -5,6 +5,8 @@ import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
 config({ path: fileURLToPath(new URL("../.env", import.meta.url)) });
 const provider = new JsonRpcProvider({ url: "https://rpc.testnet.fastnear.com" });
+const CONTRACT = process.env.SHEARPIN_CONTRACT || "v1.shearpin-owner-2.testnet";
+const POLICY = process.env.SHEARPIN_POLICY || "sat1";
 const keyJson = JSON.parse(readFileSync(fileURLToPath(new URL("../agent-key.json", import.meta.url)), "utf8"));
 const agent = new Account(keyJson.account_id, provider, new KeyPairSigner(KeyPair.fromString(keyJson.secret_key)));
 console.log("signing as:", keyJson.account_id, "(function-call key only)");
@@ -30,9 +32,9 @@ const payload = [0xc0 + inner.length, ...inner];
 // counterparty check first (wrapper behavior)
 const res = await provider.query({
   request_type: "call_function",
-  account_id: "v3.shearpin-owner-1.testnet",
+  account_id: CONTRACT,
   method_name: "check_counterparty",
-  args_base64: Buffer.from(JSON.stringify({ policy_id: "sat1", address: VENDOR })).toString("base64"),
+  args_base64: Buffer.from(JSON.stringify({ policy_id: POLICY, address: VENDOR })).toString("base64"),
   finality: "final",
 });
 const [verdict] = JSON.parse(Buffer.from(res.result).toString("utf8"));
@@ -42,8 +44,8 @@ if (verdict === "block") { console.log("REFUSED"); process.exit(0); }
 let out;
 try {
   out = await agent.signAndSendTransaction({
-  receiverId: "v3.shearpin-owner-1.testnet",
-  actions: [actions.functionCall("request_signature", { policy_id: "sat1", derivation_path: "eth/0", key_type: "ecdsa", payload }, 300n * 10n ** 12n, 0n)],
+  receiverId: CONTRACT,
+  actions: [actions.functionCall("request_signature", { policy_id: POLICY, derivation_path: "eth/0", key_type: "ecdsa", payload }, 300n * 10n ** 12n, 0n)],
   });
 } catch (err) {
   const logs = (err.transactionResult?.receipts_outcome ?? []).flatMap((r) => r.outcome?.logs ?? []);

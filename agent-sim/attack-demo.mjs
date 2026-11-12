@@ -30,7 +30,7 @@ const SEPOLIA = 11155111n;
 // the "known-bad address": two independent agents already reported it
 const ATTACKER = "0x000000000000000000000000000000000000dEaD";
 // a second reporter account so the blocklist reaches the block threshold
-const REPORTER2 = "reporter2.shearpin-owner-1.testnet";
+const REPORTER2 = process.env.SHEARPIN_REPORTER2_ID || "shearpin-reporter-2.testnet";
 
 const provider = new JsonRpcProvider({ url: RPC });
 const owner = new Account(OWNER, provider, new KeyPairSigner(KeyPair.fromString(process.env.SHEARPIN_OWNER_KEY)));
@@ -108,6 +108,14 @@ if (reports.length < 2) {
     log("[setup] falling back: reporting from owner under a different sub-account is not possible — using testnet faucet account if configured");
   }
 }
+
+// wait until the reports are visible at finality (receipts can lag the tx outcome)
+for (let i = 0; i < 15; i++) {
+  reports = await view("get_reports", { address: ATTACKER });
+  if (reports.length >= 2) break;
+  await new Promise((r) => setTimeout(r, 2000));
+}
+log(`[setup] ${reports.length} report(s) on-chain:`, reports.map((r) => `${r.reporter}:${r.category}`));
 
 // ---------- step 1: the wrapper check (what the agent sees) ----------
 log("");

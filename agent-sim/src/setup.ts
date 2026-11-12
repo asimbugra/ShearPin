@@ -40,8 +40,8 @@ async function main() {
   await sendTx(provider, signer, "create_policy", {
     policy_id: POLICY_ID,
     agent_label: "SAT-1",
-    max_tx: "10",
-    daily_limit: "50",
+    max_tx: "10000000000000000",     // 0.01 ETH per tx (wei)
+    daily_limit: "100000000000000000", // 0.1 ETH per day (wei)
     cooldown_blocks: 2,
     rate_limit_per_day: 20,
   });
@@ -52,6 +52,19 @@ async function main() {
     signer: OWNER,
   });
   console.log("signer set (owner acts as agent runtime for the demo)");
+
+  // the demo vendor is owner-vetted; everything else is unvetted (warn)
+  await sendTx(provider, signer, "set_allowed_recipients", {
+    policy_id: POLICY_ID,
+    recipients: ["0xd4e56740f876afec8011e179a8b763074e6b5c8f"],
+  });
+  console.log("recipients set (vendor allowlisted)");
+
+  await sendTx(provider, signer, "set_allowed_chain_ids", {
+    policy_id: POLICY_ID,
+    chain_ids: [11155111], // Sepolia
+  });
+  console.log("chain ids set (Sepolia only)");
 
   const view = await client.getPolicy(POLICY_ID);
   console.log("policy view:", view);
@@ -73,8 +86,7 @@ async function main() {
       frozen: view.frozen,
       status: view.status,
     }),
-  });
-  console.log("backend seeded");
+  }).catch(() => console.log("backend not running — skipped ledger seed (optional)"));
 }
 
 main().catch((e) => {

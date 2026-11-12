@@ -1,0 +1,6 @@
+◇ injected env (0) from ../.env
+signing as: sat1-agent.shearpin-owner-2.testnet (function-call key only)
+counterparty verdict: allow
+allow log: {"event":"allow","policy":"sat1","amount":1000000000,"recipient":"0xd4e56740f876afec8011e179a8b763074e6b5c8f","spent_today":420001000000000,"requests_today":1,"is_erc20":false,"chain_id":11155111}
+signature_ok: YES
+AGENT KEY END-TO-END: signature requested with the restricted key only
