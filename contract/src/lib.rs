@@ -104,12 +104,31 @@ pub struct Policy {
     pub frozen: bool,
 }
 
+/// a counterparty report: who reported which address, why, with evidence.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, PartialEq, near_sdk::serde::Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Report {
+    pub reporter: AccountId,
+    pub category: String,   // e.g. "phishing", "drainer", "fake_vendor"
+    pub evidence: String,   // required: URL or tx hash proving the claim
+    pub block_height: BlockHeight,
+}
+
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Contract {
     pub policies: IterableMap<String, Policy>,
     pub signers: IterableMap<String, AccountId>,
+    /// shared counterparty blocklist: lowercase 0x address -> reports.
+    /// anyone can report; each report MUST carry evidence. addresses with
+    /// >= REPORTS_TO_BLOCK reports are denied for every policy (DENY gate).
+    pub blocklist: IterableMap<String, Vec<Report>>,
 }
+
+/// reports required before an address is hard-blocked for all policies.
+pub const REPORTS_TO_BLOCK: usize = 2;
+/// max reports stored per address (bounds state growth).
+pub const MAX_REPORTS_PER_ADDRESS: usize = 32;
 
 #[near]
 impl Contract {
@@ -119,6 +138,7 @@ impl Contract {
         Self {
             policies: IterableMap::new(b"p"),
             signers: IterableMap::new(b"s"),
+            blocklist: IterableMap::new(b"b"),
         }
     }
 
@@ -385,6 +405,99 @@ impl Contract {
     }
 
     // ------------------------------------------------------------------
+    // shared counterparty blocklist (the "counterparty check" data layer)
+    // ------------------------------------------------------------------
+
+    /// report a bad counterparty. anyone can call; each report MUST carry
+    /// evidence (URL or tx hash). an address with >= REPORTS_TO_BLOCK
+    /// reports is denied for every policy before any other check runs.
+    pub fn report(&mut self, address: String, category: String, evidence: String) {
+        let mut a = address.trim().to_lowercase();
+        if !a.starts_with("0x") {
+            a = format!("0x{}", a);
+        }
+        require!(a.len() == 42, "address must be a 20-byte hex");
+        require!(!category.is_empty() && category.len() <= 32, "category 1-32 chars");
+        require!(
+            !evidence.is_empty() && evidence.len() <= 256,
+            "evidence required (URL or tx hash, <= 256 chars)"
+        );
+        let mut reports = self.blocklist.get(&a).cloned().unwrap_or_default();
+        let reporter = env::predecessor_account_id();
+        // one report per reporter per address — re-reporting updates nothing
+        require!(
+            !reports.iter().any(|r| r.reporter == reporter),
+            "already reported by this account"
+        );
+        require!(reports.len() < MAX_REPORTS_PER_ADDRESS, "report cap reached");
+        reports.push(Report {
+            reporter,
+            category,
+            evidence,
+            block_height: env::block_height(),
+        });
+        let blocked = reports.len() >= REPORTS_TO_BLOCK;
+        self.blocklist.insert(a.clone(), reports);
+        env::log_str(&format!(
+            "{{\"event\":\"reported\",\"address\":\"{}\",\"blocked\":{}}}",
+            a, blocked
+        ));
+    }
+
+    /// counterparty check view: (verdict, reasons). verdict is one of
+    /// "allow" | "warn" | "block".
+    /// - block: address has >= REPORTS_TO_BLOCK evidence-backed reports
+    /// - warn:  address has 1 report, OR is not in the policy's allowlist
+    ///   (unvetted counterparty — allow, but a human should look)
+    /// - allow: in the policy allowlist with zero reports
+    pub fn check_counterparty(&self, policy_id: String, address: String) -> (String, Vec<String>) {
+        let mut a = address.trim().to_lowercase();
+        if !a.starts_with("0x") {
+            a = format!("0x{}", a);
+        }
+        let reports = self.blocklist.get(&a).cloned().unwrap_or_default();
+        let mut reasons: Vec<String> = Vec::new();
+        if reports.len() >= REPORTS_TO_BLOCK {
+            for r in &reports {
+                reasons.push(format!(
+                    "reported as {} by {} (evidence: {})",
+                    r.category, r.reporter, r.evidence
+                ));
+            }
+            return ("block".to_string(), reasons);
+        }
+        let policy = self.policies.get(&policy_id).cloned();
+        let allowlisted = policy
+            .as_ref()
+            .map(|p| p.allowed_recipients.iter().any(|r| r == &a))
+            .unwrap_or(false);
+        if !reports.is_empty() {
+            let r = &reports[0];
+            reasons.push(format!(
+                "1 report: {} by {} (evidence: {}) — needs a second report to block",
+                r.category, r.reporter, r.evidence
+            ));
+        }
+        if !allowlisted {
+            reasons.push("not in the policy recipient allowlist (unvetted)".to_string());
+        }
+        if reasons.is_empty() {
+            ("allow".to_string(), reasons)
+        } else {
+            ("warn".to_string(), reasons)
+        }
+    }
+
+    /// full report list for an address (for dashboards / human review).
+    pub fn get_reports(&self, address: String) -> Vec<Report> {
+        let mut a = address.trim().to_lowercase();
+        if !a.starts_with("0x") {
+            a = format!("0x{}", a);
+        }
+        self.blocklist.get(&a).cloned().unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------------
     // the hot path: agent asks, policy decides before any mpc call
     // ------------------------------------------------------------------
 
@@ -510,6 +623,30 @@ impl Contract {
             return PromiseOrValue::Value(
                 "SHEARPIN_LEGACY_TX: EIP-155 transaction required (chainId mandatory)".to_string(),
             );
+        }
+
+        // shared blocklist gate: an address with enough evidence-backed
+        // reports is denied for EVERY policy, regardless of allowlists.
+        // runs before the recipient allowlist so a reported address can
+        // never be paid even if an owner mistakenly allowlists it later.
+        {
+            let mut r_addr = recipient.trim().to_lowercase();
+            if !r_addr.starts_with("0x") {
+                r_addr = format!("0x{}", r_addr);
+            }
+            let reports = self.blocklist.get(&r_addr).cloned().unwrap_or_default();
+            if reports.len() >= REPORTS_TO_BLOCK {
+                policy.tripped = true;
+                self.policies.insert(policy_id.clone(), policy);
+                env::log_str(&format!(
+                    "{{\"event\":\"deny\",\"policy\":\"{}\",\"reason\":\"counterparty_blocked\",\"amount\":{},\"recipient\":\"{}\",\"chain_id\":{}}}",
+                    policy_id, amount, r_addr,
+                    tx.chain_id.map(|c| c.to_string()).unwrap_or("null".to_string())
+                ));
+                return PromiseOrValue::Value(
+                    "SHEARPIN_COUNTERPARTY_BLOCKED: address is on the shared blocklist (evidence-backed reports) — pin snapped".to_string(),
+                );
+            }
         }
 
         // fixed check order — do not reorder. fail-closed on anything

@@ -108,6 +108,68 @@ export class ShearPinClient {
   }
 
   /**
+   * counterparty check (the agent-side wrapper's data source).
+   * asks the contract for allow | warn | block + reasons BEFORE any
+   * signing attempt. this is a view call — free, no tx, no signature.
+   */
+  async checkCounterparty(
+    policyId: string,
+    address: string,
+  ): Promise<{ verdict: "allow" | "warn" | "block"; reasons: string[] }> {
+    return this.callView("check_counterparty", {
+      policy_id: policyId,
+      address,
+    });
+  }
+
+  /** report a bad counterparty to the shared blocklist (evidence required) */
+  async reportCounterparty(
+    address: string,
+    category: string,
+    evidence: string,
+  ): Promise<void> {
+    await this.account.signAndSendTransaction({
+      receiverId: this.cfg.contractId,
+      actions: [
+        najActions.functionCall(
+          "report",
+          { address, category, evidence },
+          BigInt(50) * TGAS,
+          0n,
+        ),
+      ],
+    });
+  }
+
+  /**
+   * guarded spend: the agent-side wrapper required by the AI-security
+   * flow. refuses to even submit when the counterparty verdict is block;
+   * asks a human when it is warn (onWarn must resolve true to proceed).
+   * only an allow verdict (or an approved warn) reaches requestSpend —
+   * where the on-chain gates check everything again.
+   */
+  async guardedSpend(
+    req: SpendRequest,
+    recipient: string,
+    onWarn: (reasons: string[]) => Promise<boolean>,
+  ): Promise<SpendOutcome | { kind: "refused"; verdict: string; reasons: string[] }> {
+    const { verdict, reasons } = await this.checkCounterparty(
+      req.policyId,
+      recipient,
+    );
+    if (verdict === "block") {
+      return { kind: "refused", verdict, reasons };
+    }
+    if (verdict === "warn") {
+      const approved = await onWarn(reasons);
+      if (!approved) {
+        return { kind: "refused", verdict, reasons };
+      }
+    }
+    return this.requestSpend(req);
+  }
+
+  /**
    * the hot path. sends the RLP-encoded spend request; returns the verdict.
    * on deny the contract panicked — we surface the SHEARPIN_* reason.
    * on allow the mpc signature is requested through the contract's own

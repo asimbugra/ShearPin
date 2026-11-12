@@ -958,3 +958,77 @@ fn erc20_gas_burn_still_counts_to_native_daily() {
     assert_eq!(expect_deny(&mut c, "p1", make_erc20_tx(TOKEN, VENDOR, 1000, 11155111)), "SHEARPIN_OVER_DAILY");
     assert_eq!(c.policy_status("p1".into()), "tripped");
 }
+
+// ---------------------------------------------------------------------------
+// counterparty blocklist
+// ---------------------------------------------------------------------------
+
+#[test]
+fn counterparty_check_verdicts() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 100_000_000, 500_000_000_000_000_000);
+    let ATTACKER = "0x0000000000000000000000000000000000000001";
+
+    // allowlisted vendor, zero reports -> allow
+    let (v, r) = c.check_counterparty("p1".into(), VENDOR.into());
+    assert_eq!(v, "allow");
+    assert!(r.is_empty());
+
+    // allowlisted vendor with 1 report -> warn
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
+    c.report(VENDOR.into(), "late_delivery".into(), "https://evidence.example/case-1".into());
+    let (v, r) = c.check_counterparty("p1".into(), VENDOR.into());
+    assert_eq!(v, "warn");
+    assert!(r.iter().any(|x| x.contains("1 report")));
+
+    // second report by a different account -> block
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    c.report(VENDOR.into(), "drainer".into(), "0xabc123".into());
+    let (v, r) = c.check_counterparty("p1".into(), VENDOR.into());
+    assert_eq!(v, "block");
+    assert!(r.iter().any(|x| x.contains("drainer")));
+
+    // unknown (not allowlisted, not reported) -> warn (unvetted)
+    let (v, r) = c.check_counterparty("p1".into(), ATTACKER.into());
+    assert_eq!(v, "warn");
+    assert!(r.iter().any(|x| x.contains("unvetted")));
+}
+
+#[test]
+fn report_requires_evidence_and_unique_reporter() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
+    // no evidence -> panic
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.report(VENDOR.into(), "phishing".into(), "".into());
+    })).unwrap_err();
+    // duplicate reporter -> panic
+    c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/1".into());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/2".into());
+    })).unwrap_err();
+    // get_reports returns the one report
+    let reps = c.get_reports(VENDOR.into());
+    assert_eq!(reps.len(), 1);
+    assert_eq!(reps[0].category, "phishing");
+}
+
+#[test]
+fn blocked_counterparty_denies_even_when_allowlisted() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 1_000_000_000_000_000_000, 10_000_000_000_000_000_000);
+    // vendor is allowlisted by the demo setup; report it twice -> blocked
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
+    c.report(VENDOR.into(), "drainer".into(), "https://evidence.example/x".into());
+    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
+    c.report(VENDOR.into(), "drainer".into(), "0xdeadbeef".into());
+    // a payment to the (still allowlisted) vendor must now be denied + trip
+    assert_eq!(
+        expect_deny(&mut c, "p1", make_eip155_tx(100)),
+        "SHEARPIN_COUNTERPARTY_BLOCKED"
+    );
+    assert_eq!(c.policy_status("p1".into()), "tripped");
+}

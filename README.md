@@ -65,9 +65,10 @@ The agent submits the **raw RLP-encoded unsigned EIP-155 EVM transaction**. The 
 7. **Chain allowlist** — `chainId` must be in `allowed_chain_ids` (EIP-155 mandatory; legacy 6-field txs rejected)
 8. **Calldata policy** — empty data = native transfer; non-empty must be an ERC-20 `transfer(address,uint256)` (selector `0xa9059cbb`) with `value == 0`, decoded on-chain
 9. **Token allowlist** — ERC-20 `to` (token contract) must be in `allowed_tokens` with a per-token cap; token units are tracked in a **separate per-token daily counter**, never mixed with the wei budget
-10. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
-11. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
-12. **Daily cap** — cumulative spend + gas burn cannot exceed `daily_limit` (snaps pin on breach)
+10. **Counterparty blocklist** — shared evidence-backed reports: an address with ≥2 reports is denied for EVERY policy (`SHEARPIN_COUNTERPARTY_BLOCKED`), even if allowlisted
+11. **Recipient allowlist** — actual recipient (from `to`, or from ERC-20 calldata) must be in `allowed_recipients`
+12. **Per-tx cap** — single request cannot exceed `max_tx` (snaps pin on breach)
+13. **Daily cap** — cumulative spend + gas burn cannot exceed `daily_limit` (snaps pin on breach)
 
 If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The MPC network is **never called**. No signature can ever be produced for a denied request.
 
@@ -94,6 +95,8 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 | **Compromised agent key** (stolen agent NEAR account) | The agent account can only reach `request_signature` — policy gates + caps still apply; `freeze()` stops everything in one write |
 | **Rapid-fire drain** (many small txs) | Rate limit per day + cooldown blocks between requests |
 | **Buggy agent overspending** | Per-tx cap + daily cap snap the pin; owner resets deliberately |
+| **Prompt injection** (attacker tricks the agent into paying a bad address) | Agent-side wrapper runs a counterparty check first: **block** verdict → refuses to sign; on-chain gate enforces it again (`SHEARPIN_COUNTERPARTY_BLOCKED`) even if the wrapper is bypassed |
+| **Known-bad counterparty** (reported by other agents) | Shared on-chain blocklist: anyone can `report(address, category, evidence)`; 2+ evidence-backed reports hard-block the address for **every** policy |
 
 ---
 
@@ -109,6 +112,56 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 | Trust model | Relay availability / custody | **Contract state, verifiable by anyone** |
 
 The agent gets a real address on any Chain-Signatures-supported chain. But the signing authority sits behind **one NEAR policy contract**: `one write (freeze), every chain off`.
+
+---
+
+## Counterparty Check (allow / warn / block)
+
+Before any payment the agent-side wrapper asks the contract about the receiver:
+
+```
+check_counterparty(policy_id, address) -> verdict + reasons
+```
+
+- **block** — the address has ≥2 evidence-backed reports on the shared blocklist. The wrapper **refuses to sign** (no tx is ever submitted), and the on-chain gate enforces the same verdict (`SHEARPIN_COUNTERPARTY_BLOCKED`, pin snaps) even if the wrapper is bypassed entirely.
+- **warn** — something deserves a human look: a single report exists, or the address is not in the policy's allowlist (unvetted). The wrapper calls its `onWarn` hook and only proceeds on explicit human approval.
+- **allow** — allowlisted with zero reports.
+
+**The shared blocklist.** Anyone can report a bad counterparty on-chain:
+
+```
+report(address, category, evidence)   // evidence (URL or tx hash) is REQUIRED
+```
+
+Reports are public, immutable, and carry their evidence — every other agent (any policy, any owner) inherits the block decision at 2+ reports. One report per reporter per address; state growth is capped.
+
+**Attack demo (live, with logs):** a prompt-injected agent is told to pay a known-bad address; the wrapper blocks, and the defense-in-depth on-chain submission is denied with `SHEARPIN_COUNTERPARTY_BLOCKED`. Full log: [`docs/attack-demo.log`](docs/attack-demo.log), script: `agent-sim/attack-demo.mjs`.
+
+**Signals & data sources** (current + planned):
+
+| Signal | Source | How |
+|---|---|---|
+| Shared blocklist reports | ShearPin contract state | `check_counterparty` / `get_reports` view calls — on-chain, free |
+| Recipient vetted by owner | Policy `allowed_recipients` | same view call; absence → warn |
+| Account age & activity (planned) | Etherscan/Blockscout API, NEAR indexer | first-tx timestamp, tx count, nonce velocity |
+| Contract vs EOA + recent code change (planned) | `eth_getCode` + code-hash history | any diff within N days → warn |
+| Prior interactions (planned) | agent EOA tx history | prior successful transfer to the receiver lowers the score |
+
+The first two rows ship today; the rest are additive to `check_counterparty` and require no contract change (the verdict logic already merges multiple reasons).
+
+---
+
+## The Agent Key (function-call access key, never full access)
+
+The agent NEAR account signs with a **function-call access key scoped to one contract**:
+
+- receiver: the ShearPin contract only
+- methods: `request_signature` only
+- allowance: just enough for the MPC forwarding deposit
+
+It cannot transfer NEAR, call any other contract, add keys, or delete the account. Stealing it buys the thief exactly one capability: requesting signatures that must pass every policy gate. `freeze()` (owner-only) still stops everything instantly.
+
+Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added).
 
 ---
 
