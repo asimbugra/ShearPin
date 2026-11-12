@@ -54,6 +54,13 @@ export interface SignalOptions {
   now?: () => number;
   /** per-signal timeout in ms (default 5000) */
   timeoutMs?: number;
+  /**
+   * fail-closed mode: an UNREACHABLE signal (no key, network error,
+   * timeout) is treated as RISK (warn) instead of silently ignored.
+   * for a security tool, "couldn't check" should not mean "safe".
+   * default false (availability-first).
+   */
+  failClosed?: boolean;
 }
 
 /** warn thresholds */
@@ -198,8 +205,19 @@ async function contractSignal(
   if (code === "0x") {
     return { name: "contract", value: "EOA (no code)", risk: false };
   }
-  if (!/^0x([0-9a-fA-F]{2})*$/.test(code)) {
+  if (typeof code !== "string" || !/^0x([0-9a-fA-F]{2})*$/.test(code)) {
     return { name: "contract", value: "unavailable", risk: false, reason: "signal unavailable: contract (rpc returned a malformed code value)" };
+  }
+  if (code.toLowerCase().startsWith("0xef0100")) {
+    // EIP-7702 delegation indicator: an "EOA" that delegated to contract
+    // code. the effective code can be swapped by the signer at will —
+    // treat with the same suspicion as a mutable contract.
+    return {
+      name: "contract",
+      value: `EIP-7702 delegated EOA (code ${code})`,
+      risk: true,
+      reason: "address carries an EIP-7702 delegation (code 0xef0100…) — the signer can swap the delegated contract at will; treat like mutable contract code",
+    };
   }
   const store = opts.codeStore ?? defaultCodeStore;
   const codeHash = keccak256(code);
@@ -283,8 +301,13 @@ export async function enrichCounterparty(
   const reasons = [...base.reasons];
   for (const s of signals) {
     if (s.reason) reasons.push(s.reason);
+    if (opts.failClosed && s.value === "unavailable") {
+      reasons.push(`fail-closed: ${s.name} unreachable — treated as risk`);
+    }
   }
-  const anyRisk = signals.some((s) => s.risk);
+  const anyRisk =
+    signals.some((s) => s.risk) ||
+    (opts.failClosed === true && signals.some((s) => s.value === "unavailable"));
   const verdict = base.verdict === "block" ? "block" : anyRisk ? "warn" : base.verdict;
   return { verdict, reasons, signals };
 }

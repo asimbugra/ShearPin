@@ -99,3 +99,26 @@ describe("guardedSpend with signal enrichment", () => {
     expect(stub.spendCalls()).toBe(1);
   });
 });
+
+describe("reportCounterparty attaches the anti-Sybil stake", () => {
+  it("sends the 0.01 NEAR REPORT_DEPOSIT the contract now requires", async () => {
+    let captured: { actions: Array<{ deposit: bigint }> } | null = null;
+    const stub = {
+      cfg: { contractId: "test.near" },
+      account: {
+        signAndSendTransaction: async (args: never) => {
+          captured = args as never;
+          return {};
+        },
+      },
+    };
+    await ShearPinClient.prototype.reportCounterparty.call(
+      stub as never,
+      "0xabc0000000000000000000000000000000000000",
+      "drainer",
+      "https://evidence.example/1",
+    );
+    const action = (captured as never as { actions: Array<{ functionCall: { deposit: bigint } }> }).actions[0].functionCall;
+    expect(action.deposit).toBe(10n ** 22n); // REPORT_DEPOSIT
+  });
+});

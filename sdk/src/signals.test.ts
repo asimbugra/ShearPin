@@ -264,4 +264,50 @@ describe("enrichCounterparty", () => {
     expect(out.reasons.join(" ")).toMatch(/signal unavailable: account-age/);
     expect(out.reasons.join(" ")).toMatch(/signal unavailable: prior-interactions/);
   });
+
+  it("failClosed: unreachable signals upgrade allow to warn", async () => {
+    const fetchFn = makeFetch([
+      { match: isEtherscan, body: {}, throw: new Error("boom") },
+      { match: isRpc, body: { jsonrpc: "2.0", id: 1, result: "0x" } },
+    ]);
+    const out = await enrichCounterparty(stubClient("allow"), "sat1", "0x334", {
+      etherscanApiKey: "K",
+      evmRpcUrl: "http://rpc",
+      fetchFn,
+      now: () => NOW,
+      failClosed: true,
+    });
+    expect(out.verdict).toBe("warn"); // unreachable != risk-free
+    expect(out.reasons.join(" ")).toMatch(/fail-closed/);
+  });
+
+  it("failClosed keeps block when signals are unavailable", async () => {
+    const out = await enrichCounterparty(stubClient("block", ["reported as drainer"]), "sat1", "0x344", {
+      now: () => NOW,
+      failClosed: true,
+    });
+    expect(out.verdict).toBe("block"); // never downgraded
+  });
+
+  it("warns when an EOA has an EIP-7702 delegation", async () => {
+    const fetchFn = makeFetch([
+      {
+        match: isEtherscan,
+        body: txlist([]),
+        // no etherscan route needed — only the rpc matters here
+        throw: new Error("no etherscan in this test"),
+      },
+      // 0xef0100 prefix = EIP-7702 delegation indicator + delegated address
+      { match: isRpc, body: { jsonrpc: "2.0", id: 1, result: "0xef0100aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
+    ]);
+    const out = await enrichCounterparty(stubClient("allow"), "sat1", "0x354", {
+      etherscanApiKey: "K",
+      evmRpcUrl: "http://rpc",
+      fetchFn,
+      now: () => NOW,
+    });
+    expect(out.verdict).toBe("warn");
+    expect(out.reasons.join(" ")).toMatch(/EIP-7702/);
+    expect(out.signals.find((s) => s.name === "contract")?.risk).toBe(true);
+  });
 });

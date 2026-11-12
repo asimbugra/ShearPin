@@ -28,7 +28,7 @@ use near_sdk::store::IterableMap;
 use near_sdk::json_types::U128;
 use near_sdk::serde_json::json;
 use near_sdk::{
-    env, ext_contract, near, require, AccountId, BlockHeight, PanicOnDefault, Promise,
+    env, ext_contract, near, require, AccountId, BlockHeight, NearToken, PanicOnDefault, Promise,
     PromiseOrValue,
 };
 
@@ -129,6 +129,11 @@ pub struct Contract {
 pub const REPORTS_TO_BLOCK: usize = 2;
 /// max reports stored per address (bounds state growth).
 pub const MAX_REPORTS_PER_ADDRESS: usize = 32;
+/// anti-Sybil stake per report: covers the report's on-chain storage AND
+/// makes mass-reporting expensive for the reporter. kept by the contract
+/// (never refunded) — spam reports burn the REPORTER's money, not the
+/// contract's balance.
+pub const REPORT_DEPOSIT: u128 = 10_000_000_000_000_000_000_000; // 0.01 NEAR
 
 #[near]
 impl Contract {
@@ -408,10 +413,18 @@ impl Contract {
     // shared counterparty blocklist (the "counterparty check" data layer)
     // ------------------------------------------------------------------
 
-    /// report a bad counterparty. anyone can call; each report MUST carry
-    /// evidence (URL or tx hash). an address with >= REPORTS_TO_BLOCK
-    /// reports is denied for every policy before any other check runs.
+    /// report a bad counterparty. anyone can call, but each report REQUIRES
+    /// an attached deposit of REPORT_DEPOSIT (anti-Sybil stake: pays the
+    /// report's storage and makes mass false-reporting expensive — no
+    /// refunds). each report MUST carry evidence (URL or tx hash). an
+    /// address with >= REPORTS_TO_BLOCK reports is denied for every policy
+    /// whose owner has NOT allowlisted it (see check_counterparty).
+    #[payable]
     pub fn report(&mut self, address: String, category: String, evidence: String) {
+        require!(
+            env::attached_deposit() >= NearToken::from_yoctonear(REPORT_DEPOSIT),
+            "report requires an attached deposit (anti-Sybil stake)"
+        );
         let mut a = address.trim().to_lowercase();
         if !a.starts_with("0x") {
             a = format!("0x{}", a);
@@ -446,9 +459,11 @@ impl Contract {
 
     /// counterparty check view: (verdict, reasons). verdict is one of
     /// "allow" | "warn" | "block".
-    /// - block: address has >= REPORTS_TO_BLOCK evidence-backed reports
-    /// - warn:  address has 1 report, OR is not in the policy's allowlist
-    ///   (unvetted counterparty — allow, but a human should look)
+    /// - block: address has >= REPORTS_TO_BLOCK evidence-backed reports AND
+    ///   is NOT in this policy's recipient allowlist
+    /// - warn:  1 report; OR reported-but-owner-allowlisted (a Sybil mob
+    ///   cannot hard-block a vetted supplier — the OWNER re-vets by
+    ///   removing the allowlist entry); OR unvetted (not in allowlist)
     /// - allow: in the policy allowlist with zero reports
     pub fn check_counterparty(&self, policy_id: String, address: String) -> (String, Vec<String>) {
         let mut a = address.trim().to_lowercase();
@@ -456,8 +471,13 @@ impl Contract {
             a = format!("0x{}", a);
         }
         let reports = self.blocklist.get(&a).cloned().unwrap_or_default();
+        let policy = self.policies.get(&policy_id).cloned();
+        let allowlisted = policy
+            .as_ref()
+            .map(|p| p.allowed_recipients.iter().any(|r| r == &a))
+            .unwrap_or(false);
         let mut reasons: Vec<String> = Vec::new();
-        if reports.len() >= REPORTS_TO_BLOCK {
+        if reports.len() >= REPORTS_TO_BLOCK && !allowlisted {
             for r in &reports {
                 reasons.push(format!(
                     "reported as {} by {} (evidence: {})",
@@ -466,17 +486,19 @@ impl Contract {
             }
             return ("block".to_string(), reasons);
         }
-        let policy = self.policies.get(&policy_id).cloned();
-        let allowlisted = policy
-            .as_ref()
-            .map(|p| p.allowed_recipients.iter().any(|r| r == &a))
-            .unwrap_or(false);
         if !reports.is_empty() {
-            let r = &reports[0];
-            reasons.push(format!(
-                "1 report: {} by {} (evidence: {}) — needs a second report to block",
-                r.category, r.reporter, r.evidence
-            ));
+            if allowlisted {
+                reasons.push(format!(
+                    "{} report(s) on an owner-allowlisted address — reports only warn here; owner should re-vet or remove it from the allowlist",
+                    reports.len()
+                ));
+            } else {
+                let r = &reports[0];
+                reasons.push(format!(
+                    "1 report: {} by {} (evidence: {}) — needs a second report to block",
+                    r.category, r.reporter, r.evidence
+                ));
+            }
         }
         if !allowlisted {
             reasons.push("not in the policy recipient allowlist (unvetted)".to_string());
@@ -626,16 +648,22 @@ impl Contract {
         }
 
         // shared blocklist gate: an address with enough evidence-backed
-        // reports is denied for EVERY policy, regardless of allowlists.
-        // runs before the recipient allowlist so a reported address can
-        // never be paid even if an owner mistakenly allowlists it later.
+        // reports is denied for every policy whose owner has NOT allowlisted
+        // it. owner-allowlisted recipients are exempt — a Sybil mob cannot
+        // snap the pin by reporting a vetted supplier (the owner re-vets by
+        // removing the allowlist entry instead). a warn event is logged so
+        // dashboards still surface the reports.
         {
             let mut r_addr = recipient.trim().to_lowercase();
             if !r_addr.starts_with("0x") {
                 r_addr = format!("0x{}", r_addr);
             }
             let reports = self.blocklist.get(&r_addr).cloned().unwrap_or_default();
-            if reports.len() >= REPORTS_TO_BLOCK {
+            let owner_allowlisted = policy
+                .allowed_recipients
+                .iter()
+                .any(|r| r == &r_addr);
+            if reports.len() >= REPORTS_TO_BLOCK && !owner_allowlisted {
                 policy.tripped = true;
                 self.policies.insert(policy_id.clone(), policy);
                 env::log_str(&format!(
@@ -646,6 +674,12 @@ impl Contract {
                 return PromiseOrValue::Value(
                     "SHEARPIN_COUNTERPARTY_BLOCKED: address is on the shared blocklist (evidence-backed reports) — pin snapped".to_string(),
                 );
+            }
+            if reports.len() >= REPORTS_TO_BLOCK && owner_allowlisted {
+                env::log_str(&format!(
+                    "{{\"event\":\"counterparty_warned\",\"policy\":\"{}\",\"recipient\":\"{}\",\"reports\":{}}}",
+                    policy_id, r_addr, reports.len()
+                ));
             }
         }
 

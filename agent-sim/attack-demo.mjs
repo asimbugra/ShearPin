@@ -82,7 +82,7 @@ if (reports.length === 0) {
   log("[setup] reporting attacker (agent 1 of 2)...");
   await owner.signAndSendTransaction({
     receiverId: CONTRACT,
-    actions: [actions.functionCall("report", { address: ATTACKER, category: "drainer", evidence: "sepolia:0xa3cf0383e326b752c0198150284a36abc8ce27a261a3e4b9c3dc9846076448d0" }, 50n * 10n ** 12n, 0n)],
+    actions: [actions.functionCall("report", { address: ATTACKER, category: "drainer", evidence: "sepolia:0xa3cf0383e326b752c0198150284a36abc8ce27a261a3e4b9c3dc9846076448d0" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
   });
   reports = await view("get_reports", { address: ATTACKER });
 }
@@ -101,7 +101,7 @@ if (reports.length < 2) {
     log("[setup] reporting attacker (agent 2 of 2) from", REPORTER2);
     await rep2.signAndSendTransaction({
       receiverId: CONTRACT,
-      actions: [actions.functionCall("report", { address: ATTACKER, category: "phishing", evidence: "https://etherscan.io/address/0x000000000000000000000000000000000000dEaD" }, 50n * 10n ** 12n, 0n)],
+      actions: [actions.functionCall("report", { address: ATTACKER, category: "phishing", evidence: "https://etherscan.io/address/0x000000000000000000000000000000000000dEaD" }, 50n * 10n ** 12n, 10n ** 22n)], // REPORT_DEPOSIT (anti-Sybil stake)
     });
   } else {
     log(`[setup] WARNING: no second reporter account (${REPORTER2}); the demo needs 2 reports to block`);

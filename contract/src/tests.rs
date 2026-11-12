@@ -3,7 +3,7 @@
 use crate::*;
 use crate::rlp::{parse_unsigned_evm_tx, UnsignedEvmTx, ERC20_TRANSFER_SELECTOR};
 use near_sdk::test_utils::VMContextBuilder;
-use near_sdk::{testing_env, AccountId, VMContext};
+use near_sdk::{testing_env, AccountId, NearToken, VMContext};
 
 fn alice() -> AccountId {
     "alice.near".parse().unwrap()
@@ -963,6 +963,15 @@ fn erc20_gas_burn_still_counts_to_native_daily() {
 // counterparty blocklist
 // ---------------------------------------------------------------------------
 
+/// report with the required anti-Sybil deposit, from a given account
+fn report_from(c: &mut Contract, who: AccountId, address: &str, category: &str, evidence: &str) {
+    let mut ctx = base_ctx();
+    ctx.predecessor_account_id = who;
+    ctx.attached_deposit = NearToken::from_yoctonear(REPORT_DEPOSIT);
+    testing_env!(ctx);
+    c.report(address.into(), category.into(), evidence.into());
+}
+
 #[test]
 fn counterparty_check_verdicts() {
     testing_env!(base_ctx());
@@ -976,36 +985,68 @@ fn counterparty_check_verdicts() {
     assert!(r.is_empty());
 
     // allowlisted vendor with 1 report -> warn
-    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
-    c.report(VENDOR.into(), "late_delivery".into(), "https://evidence.example/case-1".into());
+    report_from(&mut c, alice(), VENDOR, "late_delivery", "https://evidence.example/case-1");
     let (v, r) = c.check_counterparty("p1".into(), VENDOR.into());
     assert_eq!(v, "warn");
     assert!(r.iter().any(|x| x.contains("1 report")));
 
-    // second report by a different account -> block
-    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    c.report(VENDOR.into(), "drainer".into(), "0xabc123".into());
+    // second report by a different account — but the vendor is OWNER-
+    // ALLOWLISTED: a Sybil mob cannot hard-block a vetted supplier, it
+    // stays warn until the owner re-vets (removes it from the allowlist)
+    report_from(&mut c, bob(), VENDOR, "drainer", "0xabc123");
     let (v, r) = c.check_counterparty("p1".into(), VENDOR.into());
-    assert_eq!(v, "block");
-    assert!(r.iter().any(|x| x.contains("drainer")));
+    assert_eq!(v, "warn");
+    assert!(r.iter().any(|x| x.contains("owner-allowlisted")));
 
     // unknown (not allowlisted, not reported) -> warn (unvetted)
     let (v, r) = c.check_counterparty("p1".into(), ATTACKER.into());
     assert_eq!(v, "warn");
     assert!(r.iter().any(|x| x.contains("unvetted")));
+
+    // 2 reports on a NON-allowlisted address -> hard block
+    report_from(&mut c, alice(), ATTACKER, "drainer", "https://evidence.example/a");
+    report_from(&mut c, bob(), ATTACKER, "phishing", "https://evidence.example/b");
+    let (v, r) = c.check_counterparty("p1".into(), ATTACKER.into());
+    assert_eq!(v, "block");
+    assert!(r.iter().any(|x| x.contains("drainer")));
 }
 
 #[test]
-fn report_requires_evidence_and_unique_reporter() {
+fn report_requires_deposit_evidence_and_unique_reporter() {
     testing_env!(base_ctx());
     let mut c = fresh();
-    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
-    // no evidence -> panic
+    // no deposit -> panic (anti-Sybil stake required)
+    let mut ctx = base_ctx();
+    ctx.predecessor_account_id = alice();
+    ctx.attached_deposit = NearToken::from_yoctonear(0);
+    testing_env!(ctx);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/0".into());
+    })).unwrap_err();
+    // insufficient deposit -> panic
+    let mut ctx = base_ctx();
+    ctx.predecessor_account_id = alice();
+    ctx.attached_deposit = NearToken::from_yoctonear(REPORT_DEPOSIT - 1);
+    testing_env!(ctx);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/0".into());
+    })).unwrap_err();
+
+    // valid deposit + evidence -> stored
+    report_from(&mut c, alice(), VENDOR, "phishing", "https://evidence.example/1");
+    // no evidence -> panic (deposit attached, but evidence missing)
+    let mut ctx = base_ctx();
+    ctx.predecessor_account_id = alice();
+    ctx.attached_deposit = NearToken::from_yoctonear(REPORT_DEPOSIT);
+    testing_env!(ctx);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         c.report(VENDOR.into(), "phishing".into(), "".into());
     })).unwrap_err();
     // duplicate reporter -> panic
-    c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/1".into());
+    let mut ctx = base_ctx();
+    ctx.predecessor_account_id = alice();
+    ctx.attached_deposit = NearToken::from_yoctonear(REPORT_DEPOSIT);
+    testing_env!(ctx);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         c.report(VENDOR.into(), "phishing".into(), "https://evidence.example/2".into());
     })).unwrap_err();
@@ -1016,18 +1057,31 @@ fn report_requires_evidence_and_unique_reporter() {
 }
 
 #[test]
-fn blocked_counterparty_denies_even_when_allowlisted() {
+fn allowlisted_counterparty_reports_never_block_payments() {
     testing_env!(base_ctx());
     let mut c = fresh();
     setup_demo_policy(&mut c, "p1", 1_000_000_000_000_000_000, 10_000_000_000_000_000_000);
-    // vendor is allowlisted by the demo setup; report it twice -> blocked
-    let mut ctx = base_ctx(); ctx.predecessor_account_id = alice(); testing_env!(ctx);
-    c.report(VENDOR.into(), "drainer".into(), "https://evidence.example/x".into());
-    let mut ctx = base_ctx(); ctx.predecessor_account_id = bob(); testing_env!(ctx);
-    c.report(VENDOR.into(), "drainer".into(), "0xdeadbeef".into());
-    // a payment to the (still allowlisted) vendor must now be denied + trip
+    // vendor is allowlisted by the demo setup; a Sybil mob reports it twice
+    report_from(&mut c, alice(), VENDOR, "drainer", "https://evidence.example/x");
+    report_from(&mut c, bob(), VENDOR, "drainer", "0xdeadbeef");
+    // payments to the owner-vetted vendor must still be allowed — reports
+    // only warn (the owner removes the allowlist entry if it re-vets badly)
+    let out = c.request_signature("p1".into(), "eth/0".into(), "ecdsa".into(), make_eip155_tx(100));
+    assert!(matches!(out, PromiseOrValue::Promise(_)), "allowlisted vendor must not be counterparty-blocked");
+    assert_eq!(c.policy_status("p1".into()), "cooldown"); // allow went through; cooldown started (NOT tripped)
+}
+
+#[test]
+fn blocked_counterparty_denies_non_allowlisted_address() {
+    testing_env!(base_ctx());
+    let mut c = fresh();
+    setup_demo_policy(&mut c, "p1", 1_000_000_000_000_000_000, 10_000_000_000_000_000_000);
+    let ATTACKER = "0x0000000000000000000000000000000000000002";
+    // NOT allowlisted; two independent reports -> hard block, pin snaps
+    report_from(&mut c, alice(), ATTACKER, "drainer", "https://evidence.example/x");
+    report_from(&mut c, bob(), ATTACKER, "phishing", "0xdeadbeef");
     assert_eq!(
-        expect_deny(&mut c, "p1", make_eip155_tx(100)),
+        expect_deny(&mut c, "p1", make_eip155_tx_to_addr(ATTACKER, 100, 11155111)),
         "SHEARPIN_COUNTERPARTY_BLOCKED"
     );
     assert_eq!(c.policy_status("p1".into()), "tripped");

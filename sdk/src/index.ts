@@ -127,7 +127,8 @@ export class ShearPinClient {
     });
   }
 
-  /** report a bad counterparty to the shared blocklist (evidence required) */
+  /** report a bad counterparty to the shared blocklist (evidence required;
+   *  attaches the contract's REPORT_DEPOSIT anti-Sybil stake, 0.01 NEAR) */
   async reportCounterparty(
     address: string,
     category: string,
@@ -140,7 +141,7 @@ export class ShearPinClient {
           "report",
           { address, category, evidence },
           BigInt(50) * TGAS,
-          0n,
+          BigInt("10000000000000000000000"), // 0.01 NEAR — REPORT_DEPOSIT
         ),
       ],
     });
