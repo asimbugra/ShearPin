@@ -7,6 +7,8 @@
 **Live on NEAR testnet:** `v1.shearpin-owner-2.testnet`  
 **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
+**▶ Watch the 48-second demo:** [`docs/shearpin-demo-video.mp4`](docs/shearpin-demo-video.mp4) — prompt injection blocked on-chain, legit spend signed to Sepolia, the kill switch in action.
+
 ---
 
 ## The Problem
