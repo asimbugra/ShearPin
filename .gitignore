@@ -13,3 +13,4 @@ backend/shearpin.db*
 shearpin.db*
 !docs/*.log
 agent-key.json
+video/out/
