@@ -300,6 +300,152 @@ app.post("/policies/:id/reset", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------- counterparty check (UI)
+
+/** plain JSON-RPC view call — no signing key involved */
+async function rpcView<T>(method: string, args: Record<string, unknown>): Promise<T> {
+  const res = await fetch(RPC, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "c",
+      method: "query",
+      params: {
+        request_type: "call_function",
+        account_id: CONTRACT,
+        method_name: method,
+        args_base64: Buffer.from(JSON.stringify(args)).toString("base64"),
+        finality: "final",
+      },
+    }),
+  });
+  const body = (await res.json()) as {
+    result?: { result: number[]; error?: string };
+    error?: { message?: string };
+  };
+  if (body.result?.error) throw new Error(body.result.error.slice(0, 200));
+  if (body.error) throw new Error((body.error.message ?? "rpc error").slice(0, 200));
+  return JSON.parse(Buffer.from(body.result!.result).toString("utf8")) as T;
+}
+
+/** spawn the agent-sim helper (enrich/report), parse its last JSON line */
+function counterpartyAction(args: string[]): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    if (!CONTRACT) return reject(new Error("SHEARPIN_CONTRACT not configured"));
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const helperDir = path.resolve(here, "../../agent-sim");
+    const child = spawn(process.execPath, ["counterparty-action.mjs", ...args], {
+      cwd: helperDir,
+      env: { ...process.env },
+    });
+    let out = "";
+    let err = "";
+    child.on("error", (e) => reject(new Error(`spawn failed: ${e.message}`)));
+    child.stdout.on("data", (d) => (out += d));
+    child.stderr.on("data", (d) => (err += d));
+    child.on("close", (code) => {
+      if (code === 0) {
+        try {
+          const last = out.trim().split("\n").pop();
+          if (!last) throw new Error("empty");
+          resolve(JSON.parse(last) as Record<string, unknown>);
+        } catch {
+          reject(new Error("unparseable counterparty-action output"));
+        }
+      } else {
+        reject(new Error(err.trim().slice(0, 300) || `counterparty action exited ${code}`));
+      }
+    });
+  });
+}
+
+const normalizeAddr = (a: string) => {
+  const t = a.trim().toLowerCase();
+  return t.startsWith("0x") ? t : `0x${t}`;
+};
+
+app.get("/counterparty/check", async (req, res) => {
+  try {
+    const address = normalizeAddr(String(req.query.address ?? ""));
+    const policyId = String(req.query.policy ?? "sat1");
+    if (!/^0x[0-9a-f]{40}$/.test(address)) {
+      return res.status(400).json({ error: "address must be a 20-byte hex (0x + 40 hex chars)" });
+    }
+    const [verdict, reasons] = await rpcView<[string, string[]]>("check_counterparty", {
+      policy_id: policyId,
+      address,
+    });
+    const reports = await rpcView<Array<{ reporter: string; category: string; evidence: string; block_height: number }>>(
+      "get_reports",
+      { address },
+    );
+    res.json({ address, policy: policyId, verdict, reasons, reports });
+  } catch (e) {
+    res.status(500).json({ error: String(e).slice(0, 300) });
+  }
+});
+
+app.get("/counterparty/enrich", async (req, res) => {
+  try {
+    const address = normalizeAddr(String(req.query.address ?? ""));
+    const policyId = String(req.query.policy ?? "sat1");
+    if (!/^0x[0-9a-f]{40}$/.test(address)) {
+      return res.status(400).json({ error: "address must be a 20-byte hex (0x + 40 hex chars)" });
+    }
+    const out = await counterpartyAction(["enrich", address, policyId]);
+    const reports = await rpcView<Array<{ reporter: string; category: string; evidence: string; block_height: number }>>(
+      "get_reports",
+      { address },
+    );
+    res.json({ address, policy: policyId, reports, ...out });
+  } catch (e) {
+    res.status(500).json({ error: String(e).slice(0, 300) });
+  }
+});
+
+app.get("/counterparty/reports", async (req, res) => {
+  try {
+    const address = normalizeAddr(String(req.query.address ?? ""));
+    if (!/^0x[0-9a-f]{40}$/.test(address)) {
+      return res.status(400).json({ error: "address must be a 20-byte hex (0x + 40 hex chars)" });
+    }
+    const reports = await rpcView<Array<{ reporter: string; category: string; evidence: string; block_height: number }>>(
+      "get_reports",
+      { address },
+    );
+    res.json({ address, reports });
+  } catch (e) {
+    res.status(500).json({ error: String(e).slice(0, 300) });
+  }
+});
+
+app.post("/counterparty/report", async (req, res) => {
+  try {
+    const address = normalizeAddr(String(req.body?.address ?? ""));
+    const category = String(req.body?.category ?? "").trim();
+    const evidence = String(req.body?.evidence ?? "").trim();
+    if (!/^0x[0-9a-f]{40}$/.test(address)) {
+      return res.status(400).json({ error: "address must be a 20-byte hex (0x + 40 hex chars)" });
+    }
+    if (!category || category.length > 32) {
+      return res.status(400).json({ error: "category 1-32 chars required" });
+    }
+    if (!evidence || evidence.length > 256) {
+      return res.status(400).json({ error: "evidence required (URL or tx hash, <= 256 chars)" });
+    }
+    const r = await counterpartyAction(["report", address, category, evidence]);
+    insertEvent.run("counterparty_report", JSON.stringify({ address, category, evidence, ...r }));
+    res.json({ ok: true, address, nearTx: r.txHash, logs: r.logs ?? [] });
+  } catch (e) {
+    const msg = String(e);
+    if (msg.includes("already reported")) {
+      return res.status(409).json({ ok: false, error: "this owner account already reported that address" });
+    }
+    res.status(500).json({ error: msg.slice(0, 300) });
+  }
+});
+
 /** sdk/demo feeds outcomes here so the ledger stays authoritative */
 app.post("/internal/record", (req, res) => {
   const { policyId, amount, verdict, reason, nearTx, targetChainTx } = req.body ?? {};

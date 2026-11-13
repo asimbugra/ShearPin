@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { 
+import CounterpartyScanner from './Counterparty';
+import {
   Zap, Shield, Loader2, 
   Pause, Play, 
   AlertTriangle, CheckCircle, XCircle, Info,
@@ -709,6 +710,11 @@ export default function App() {
               onSingleStep={singleStep}
             />
           </aside>
+        </div>
+
+        {/* Counterparty scanner — full width under the panels */}
+        <div className="mt-6">
+          <CounterpartyScanner policies={displayPolicies.map((p) => p.id)} />
         </div>
 
         <Footer />

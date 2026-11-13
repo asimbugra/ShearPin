@@ -274,7 +274,7 @@ node --env-file=../.env dist/demo.js   # allow → recipient deny+snap → tripp
 contract/          Rust — policy engine + Chain Signatures flow (59 unit tests)
 sdk/               TypeScript client SDK (@shearpin/sdk, 13 unit tests)
 backend/           Express REST API + SQLite ledger (audit trail)
-frontend/          React demo dashboard (breaker panel)
+frontend/          React demo dashboard (breaker panel + counterparty scanner)
 agent-sim/         Demo / setup / deploy / reset scripts (live testnet)
 scripts/gen-keys.js  One-time keypair generator for testnet accounts
 ```
@@ -291,6 +291,18 @@ Measured on the previous `v3.shearpin-owner-1.testnet` deployment (same gate pip
 | **Deny** (over per-tx cap) | policy check → pin snaps (persisted) → **no MPC call at all** | **~1.8–2.0 s** (n=3) | ~2.0 Tgas |
 
 The security story in one number: **denying abuse costs ~7x less gas than a legitimate spend** — the deny path never touches the MPC network.
+
+---
+
+## Dashboard: Counterparty Scanner UI
+
+The dashboard's **Counterparty Scanner** is the human-facing version of the whole flow — the panel an operator (or a curious juror) uses instead of the CLI:
+
+- **SCAN** an address → the verdict lamp (**ALLOW / WARN / BLOCK** with the reason list), the three off-chain signal reports (account age, contract code, prior interactions — live from any Etherscan-compatible endpoint, `ETHERSCAN_API_URL`; Blockscout works without a key), and the address's full on-chain report history
+- **REPORT THIS ADDRESS** → files a staked report (0.01 NEAR anti-Sybil stake) on the shared blocklist, signed by the backend owner key — with clean errors for duplicates and the 32-report cap
+- the breaker panel above it still shows policy cards (freeze / reset / daily-budget LEDs) and the live deny/allow feed
+
+Endpoints: `GET /api/counterparty/check|enrich|reports`, `POST /api/counterparty/report` (backend proxies the contract; secrets stay server-side). Run it: backend `pnpm start` (:8787) + frontend `pnpm dev` (:5173).
 
 ---
 
