@@ -296,7 +296,11 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 
 ## Dashboard: Counterparty Scanner UI
 
-The dashboard's **Counterparty Scanner** is the human-facing version of the whole flow — the panel an operator (or a curious juror) uses instead of the CLI:
+The dashboard's **Counterparty Scanner** is the human-facing version of the whole flow — the panel an operator (or a curious juror) uses instead of the CLI. Live against the testnet contract, real signal data:
+
+| WARN — unvetted address, risk signal from live account data | BLOCK — 2 evidence-backed shared-blocklist reports |
+|---|---|
+| ![Scanner WARN verdict with live signals](docs/scanner-warn.png) | ![Scanner BLOCK verdict with on-chain reports](docs/scanner-block.png) |
 
 - **SCAN** an address → the verdict lamp (**ALLOW / WARN / BLOCK** with the reason list), the three off-chain signal reports (account age, contract code, prior interactions — live from any Etherscan-compatible endpoint, `ETHERSCAN_API_URL`; Blockscout works without a key), and the address's full on-chain report history
 - **REPORT THIS ADDRESS** → files a staked report (0.01 NEAR anti-Sybil stake) on the shared blocklist, signed by the backend owner key — with clean errors for duplicates and the 32-report cap
