@@ -9,7 +9,7 @@ const RPC = process.env.SHEARPIN_RPC || "https://rpc.testnet.fastnear.com";
 const OWNER = process.env.SHEARPIN_SIGNER_ID;
 const OWNER_KEY = process.env.SHEARPIN_OWNER_KEY;
 const CONTRACT = process.env.SHEARPIN_CONTRACT;
-const WASM = "/opt/data/projects/ShearPin/contract/target/wasm32-unknown-unknown/release/shearpin_contract.wasm";
+const WASM = new URL("../contract/target/wasm32-unknown-unknown/release/shearpin_contract.wasm", import.meta.url).pathname;
 
 const provider = new JsonRpcProvider({ url: RPC });
 const owner = new Account(OWNER, provider, new KeyPairSigner(KeyPair.fromString(OWNER_KEY)));

@@ -1,6 +1,6 @@
 import { Account, JsonRpcProvider, KeyPairSigner, KeyPair, actions } from "near-api-js";
 import { config } from "dotenv";
-config({ path: "/opt/data/projects/ShearPin/.env" });
+config({ path: new URL("../.env", import.meta.url).pathname, quiet: true });
 
 const TGAS = 10n ** 12n;
 const RPC = process.env.SHEARPIN_RPC || "https://rpc.testnet.fastnear.com";

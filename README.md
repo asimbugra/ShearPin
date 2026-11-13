@@ -199,7 +199,7 @@ What the key cannot do: transfer NEAR, call any other contract, add/delete keys,
 
 Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
 
-**Demo convenience, stated honestly:** the dashboard backend signs owner writes (`freeze` / `reset_pin` / allowlisting) with the owner key. That is a demo shortcut — it binds to `127.0.0.1` and requires an admin token, but in **production** the owner signs those from their own wallet and the owner key never exists on the machine the agent runs on. The agent's function-call key cannot perform any of these writes.
+**Demo convenience, stated honestly:** the dashboard backend signs owner writes (`freeze` / `reset_pin` / allowlisting) with the owner key. That is a demo shortcut — it binds to `127.0.0.1` and requires an admin token, but in **production** the owner signs those from their own wallet and the owner key never exists on the machine the agent runs on. The agent's function-call key cannot perform any of these writes. The demo runs on a single machine; production keeps the owner key off it.
 
 **The trust model in one picture** — stealing the agent key buys a thief exactly one capability: asking. Stealing the owner key buys everything; that's why it never lives on the agent runtime:
 
@@ -301,7 +301,7 @@ The security story in one number: **denying abuse costs ~7x less gas than a legi
 
 ## Dashboard: Counterparty Scanner UI
 
-The dashboard's **Counterparty Scanner** is the human-facing version of the whole flow — the panel an operator (or a curious juror) uses instead of the CLI. Live against the testnet contract, real signal data:
+The dashboard's **Counterparty Scanner** is the human-facing version of the whole flow — the panel an operator uses instead of the CLI. Live against the testnet contract, real signal data:
 
 | WARN — unvetted address, risk signal from live account data | BLOCK — 2 evidence-backed shared-blocklist reports |
 |---|---|
@@ -328,7 +328,7 @@ Earlier proof from the previous `v3` deployment: a [real Sepolia tx](https://sep
 
 ## Limitations (Honest)
 
-- **Testnet only** — contract deployed to `v1.signer-prod.testnet`, not mainnet `v1.signer`
+- **Testnet only** — the MPC signer is `v1.signer-prod.testnet` (not mainnet `v1.signer`)
 - **EVM-only tx parsing** — the on-chain RLP decoder handles EIP-155 EVM txs; non-EVM chains via Chain Signatures would need their own payload decoders
 - **ERC-20 `transfer` only** — `transferFrom`, swaps, and other selectors are rejected fail-closed (adding selectors is a small, contained change)
 - **Not audited** — code is hackathon-grade, no formal verification or third-party audit

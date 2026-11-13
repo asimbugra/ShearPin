@@ -1,6 +1,6 @@
 /**
  * benchmark — measured on the live deployed contract.
- * allow path: request_signature (policy check + MPC imza turu)
+ * allow path: request_signature (policy check + MPC signing round)
  * deny path: over-tx (policy check RED, never reaches MPC)
  * output: ../bench_results.json (README table is generated from this)
  */
