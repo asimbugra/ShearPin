@@ -161,7 +161,24 @@ void recordOutcome;
 // ---------------------------------------------------------------- api
 
 const app = express();
-app.use(cors());
+// the backend holds the owner key (demo operator model) — it must never
+// be reachable from other hosts or other websites.
+app.use(cors({ origin: "http://localhost:5173" }));
+
+// every state-changing POST requires the admin token. the token lives in
+// .env on the operator's machine; the dashboard gets it injected by the
+// vite proxy (never shipped to the browser bundle).
+const ADMIN_TOKEN = process.env.SHEARPIN_ADMIN_TOKEN ?? "";
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!ADMIN_TOKEN) {
+    return res.status(501).json({ error: "SHEARPIN_ADMIN_TOKEN not configured — owner writes are disabled" });
+  }
+  const auth = req.headers.authorization ?? "";
+  if (auth !== `Bearer ${ADMIN_TOKEN}`) {
+    return res.status(401).json({ error: "unauthorized — missing or invalid admin token" });
+  }
+  next();
+}
 app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true, contract: CONTRACT }));
@@ -262,7 +279,7 @@ const updatePolicyRow = (policyId: string, patch: { frozen?: number; tripped?: n
   );
 };
 
-app.post("/policies/:id/freeze", async (req, res) => {
+app.post("/policies/:id/freeze", requireAuth, async (req, res) => {
   try {
     const r = await ownerAction("freeze", req.params.id);
     updatePolicyRow(req.params.id, { frozen: 1, status: "frozen" });
@@ -273,7 +290,7 @@ app.post("/policies/:id/freeze", async (req, res) => {
   }
 });
 
-app.post("/policies/:id/unfreeze", async (req, res) => {
+app.post("/policies/:id/unfreeze", requireAuth, async (req, res) => {
   try {
     const r = await ownerAction("unfreeze", req.params.id);
     updatePolicyRow(req.params.id, { frozen: 0, status: "live" });
@@ -284,7 +301,7 @@ app.post("/policies/:id/unfreeze", async (req, res) => {
   }
 });
 
-app.post("/policies/:id/reset", async (req, res) => {
+app.post("/policies/:id/reset", requireAuth, async (req, res) => {
   try {
     const r = await ownerAction("reset_pin", req.params.id);
     updatePolicyRow(req.params.id, { tripped: 0, status: "live" });
@@ -420,7 +437,7 @@ app.get("/counterparty/reports", async (req, res) => {
   }
 });
 
-app.post("/counterparty/report", async (req, res) => {
+app.post("/counterparty/report", requireAuth, async (req, res) => {
   try {
     const address = normalizeAddr(String(req.body?.address ?? ""));
     const category = String(req.body?.category ?? "").trim();
@@ -447,7 +464,7 @@ app.post("/counterparty/report", async (req, res) => {
 });
 
 /** sdk/demo feeds outcomes here so the ledger stays authoritative */
-app.post("/internal/record", (req, res) => {
+app.post("/internal/record", requireAuth, (req, res) => {
   const { policyId, amount, verdict, reason, nearTx, targetChainTx } = req.body ?? {};
   if (!policyId || !verdict) return res.status(400).json({ error: "policyId+verdict required" });
   insertRequest.run(
@@ -461,7 +478,7 @@ app.post("/internal/record", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/internal/policy", (req, res) => {
+app.post("/internal/policy", requireAuth, (req, res) => {
   const p = req.body ?? {};
   db.prepare(
     `INSERT INTO policies (id, owner, agent_label, max_tx, daily_limit, cooldown_blocks,
@@ -489,7 +506,7 @@ app.post("/internal/policy", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/internal/benchmark", (req, res) => {
+app.post("/internal/benchmark", requireAuth, (req, res) => {
   const { metric, value, unit } = req.body ?? {};
   if (!metric || value == null) return res.status(400).json({ error: "metric+value" });
   db.prepare(`INSERT INTO benchmarks (metric, value, unit) VALUES (?,?,?)`).run(
@@ -500,7 +517,7 @@ app.post("/internal/benchmark", (req, res) => {
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "127.0.0.1", () => {
   console.log(`shearpin backend on :${PORT} (db: ${DB_PATH})`);
   if (existsSync("/proc/version")) {
     void readFileSync("/proc/version").length; // warm read, no-op

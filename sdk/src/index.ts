@@ -194,8 +194,13 @@ export class ShearPinClient {
       // agent's function-call key can't (methods: request_signature only),
       // and an owner key on the agent runtime would defeat the whole model.
       if (opts?.autoAllowApproved) {
-        const vetting = opts.ownerClient ?? this;
-        await vetting.addAllowedRecipient(req.policyId, recipient);
+        // vetting MUST be signed by the owner's key — the agent key can't
+        // call set_allowed_recipients, and silently trying would die
+        // on-chain with a confusing error.
+        if (!opts.ownerClient) {
+          throw new Error("autoAllowApproved requires ownerClient");
+        }
+        await opts.ownerClient.addAllowedRecipient(req.policyId, recipient);
       }
     }
     return this.requestSpend(req);

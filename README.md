@@ -95,6 +95,7 @@ If **any** check fails, the transaction reverts with a `SHEARPIN_*` error. The M
 | **Prompt injection** (attacker tricks the agent into paying a bad address) | Agent-side wrapper runs a counterparty check first: **block** verdict → refuses to sign; on-chain gate enforces it again (`SHEARPIN_COUNTERPARTY_BLOCKED`) even if the wrapper is bypassed |
 | **Known-bad counterparty** (reported by other agents) | Shared on-chain blocklist: anyone can `report(address, category, evidence)` with a 0.01 NEAR stake; 2+ evidence-backed reports hard-block the address for every policy whose owner hasn't allowlisted it |
 | **Sybil report mob** (two free accounts report your real supplier to snap the pin — a DoS) | Two layers: reports require a **0.01 NEAR stake each** (mass false-reporting burns the *reporter's* money), and an **owner-allowlisted address can never be counterparty-blocked** — reports only warn; the owner re-vets by removing the allowlist entry |
+| **Agent resets its own pin via the dashboard backend** (a local injected agent calling `POST /policies/sat1/reset`) | The backend binds to **127.0.0.1 only**, and every POST (freeze / unfreeze / reset / report / ledger feed) requires an **admin bearer token** that lives in the operator's `.env`; the browser bundle never sees it (the vite proxy injects it). Production: the owner signs `reset_pin` from their own wallet — the owner key never lives on the agent's machine |
 
 ---
 
@@ -195,6 +196,8 @@ What the key cannot do: transfer NEAR, call any other contract, add/delete keys,
 - an account holding only function-call keys can't transfer NEAR or add keys — it is exactly as narrow as the list above says.
 
 Provision it: `node agent-sim/provision-agent-key.mjs` (creates the agent account with the restricted key — a full-access key is never added). Live end-to-end log — the restricted key runs the counterparty check, gets `allow`, and receives an MPC signature: [`docs/agent-key-demo.log`](docs/agent-key-demo.log).
+
+**Demo convenience, stated honestly:** the dashboard backend signs owner writes (`freeze` / `reset_pin` / allowlisting) with the owner key. That is a demo shortcut — it binds to `127.0.0.1` and requires an admin token, but in **production** the owner signs those from their own wallet and the owner key never exists on the machine the agent runs on. The agent's function-call key cannot perform any of these writes.
 
 **The trust model in one picture** — stealing the agent key buys a thief exactly one capability: asking. Stealing the owner key buys everything; that's why it never lives on the agent runtime:
 

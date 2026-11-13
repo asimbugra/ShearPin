@@ -71,7 +71,10 @@ async function main() {
 
   await fetch(`${API}/internal/policy`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(process.env.SHEARPIN_ADMIN_TOKEN ? { Authorization: `Bearer ${process.env.SHEARPIN_ADMIN_TOKEN}` } : {}),
+    },
     body: JSON.stringify({
       id: POLICY_ID,
       owner: view.owner,

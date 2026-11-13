@@ -20,6 +20,22 @@ const provider = new JsonRpcProvider({ url: RPC });
 const signer = new KeyPairSigner(KeyPair.fromString(OWNER_KEY));
 const acct = new Account(OWNER_ID, provider, signer);
 
+// pre-check so "nothing to reset" returns a clean message, not a wasm trap
+if (method === "reset_pin") {
+  const res = await provider.query({
+    request_type: "call_function",
+    account_id: CONTRACT,
+    method_name: "policy_status",
+    args_base64: Buffer.from(JSON.stringify({ policy_id: policyId })).toString("base64"),
+    finality: "final",
+  });
+  const status = JSON.parse(Buffer.from(res.result).toString("utf8"));
+  if (status !== "tripped") {
+    console.error("pin not tripped — nothing to reset");
+    process.exit(3);
+  }
+}
+
 try {
   const res = await acct.signAndSendTransaction({
     receiverId: CONTRACT,

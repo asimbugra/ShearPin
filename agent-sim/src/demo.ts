@@ -31,7 +31,10 @@ function log(scene: string, msg: string) {
 async function report(body: Record<string, unknown>) {
   await fetch(`${API}/internal/record`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(process.env.SHEARPIN_ADMIN_TOKEN ? { Authorization: `Bearer ${process.env.SHEARPIN_ADMIN_TOKEN}` } : {}),
+    },
     body: JSON.stringify(body),
   }).catch(() => undefined);
 }
@@ -129,7 +132,10 @@ async function main() {
   }
 
   // reset pin before scene 4 so the chain gate is reachable
-  await fetch(`${API}/policies/${POLICY_ID}/reset`, { method: "POST" }).catch(() => undefined);
+  await fetch(`${API}/policies/${POLICY_ID}/reset`, {
+    method: "POST",
+    headers: process.env.SHEARPIN_ADMIN_TOKEN ? { Authorization: `Bearer ${process.env.SHEARPIN_ADMIN_TOKEN}` } : {},
+  }).catch(() => undefined);
   await sleep(15_000);
 
   // scene 4 — wrong chain: same vendor but chainId=1 (mainnet) → DENY (chain)

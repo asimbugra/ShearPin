@@ -167,7 +167,7 @@ describe("guardedSpend closes the loop on human-approved warn (solution A)", () 
       req,
       "0xnew000000000000000000000000000000000000",
       async () => true, // the human approves
-      { autoAllowApproved: true },
+      { autoAllowApproved: true, ownerClient: stub as never },
     );
     expect(out).toMatchObject({ verdict: "allow" });
     expect(stub.spendCalls()).toBe(1);
@@ -277,5 +277,21 @@ describe("requestSpend is function-call-key compatible", () => {
     const action = (captured as never as { actions: Array<{ functionCall: { deposit: bigint; methodName: string } }> }).actions[0].functionCall;
     expect(action.methodName).toBe("request_signature");
     expect(action.deposit).toBe(0n); // DepositWithFunctionCall otherwise
+  });
+});
+
+describe("autoAllowApproved without ownerClient fails loudly", () => {
+  it("throws 'autoAllowApproved requires ownerClient' instead of burning the agent key", async () => {
+    const stub = warnStub();
+    await expect(
+      ShearPinClient.prototype.guardedSpend.call(
+        stub as never,
+        req,
+        "0xnew000000000000000000000000000000000000",
+        async () => true,
+        { autoAllowApproved: true }, // no ownerClient
+      ),
+    ).rejects.toThrow("autoAllowApproved requires ownerClient");
+    expect(stub.spendCalls()).toBe(0);
   });
 });
