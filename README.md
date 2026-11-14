@@ -16,7 +16,7 @@ Programmatic spending limits + instant kill-switch for AI agent wallets, powered
 
 **Live on NEAR testnet:** `v1.shearpin-owner-2.testnet` · **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
-The 48-second demo: prompt injection blocked on-chain, legit spend signed to Sepolia, the kill switch in action — [`docs/shearpin-demo-video.mp4`](docs/shearpin-demo-video.mp4).
+The 43-second demo: prompt injection blocked on-chain, legit spend signed to Sepolia, the kill switch in action — [`docs/shearpin-demo-video.mp4`](docs/shearpin-demo-video.mp4).
 
 ---
 
