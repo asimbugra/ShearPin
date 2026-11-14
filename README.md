@@ -1,13 +1,22 @@
-# ShearPin
+<div align="center">
 
-**One write, every chain off.** — Programmatic spending limits + instant kill-switch for AI agent wallets, powered by NEAR Chain Signatures.
+<img src="docs/shearpin-logo-light.png" alt="ShearPin" width="520" />
+
+**One write, every chain off.**
+
+Programmatic spending limits + instant kill-switch for AI agent wallets, powered by NEAR Chain Signatures.
+
+[![Watch the demo](https://img.shields.io/badge/▶-watch%20the%2048s%20demo-d4a843?style=for-the-badge)](docs/shearpin-demo-video.mp4)
+
+![Track](https://img.shields.io/badge/track-AI%20Security%20%26%20Defense-f85149) ![NEAR](https://img.shields.io/badge/NEAR-testnet-3fb950) ![License](https://img.shields.io/badge/license-MIT-58a6ff) ![Tests](https://img.shields.io/badge/tests-59%20contract%20%2B%2024%20SDK-3fb950)
+
+</div>
 
 > A shear pin is the mechanical safety device that snaps when torque exceeds the limit — the machine survives. ShearPin does the same for agent wallets: when a spend exceeds policy, the signature is refused. The agent survives; your funds survive.
 
-**Live on NEAR testnet:** `v1.shearpin-owner-2.testnet`  
-**Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
+**Live on NEAR testnet:** `v1.shearpin-owner-2.testnet` · **Track:** AI Security & Defense — NEAR HACKATHON: Build Beyond Boundaries
 
-**▶ Watch the 48-second demo:** [`docs/shearpin-demo-video.mp4`](docs/shearpin-demo-video.mp4) — prompt injection blocked on-chain, legit spend signed to Sepolia, the kill switch in action.
+The 48-second demo: prompt injection blocked on-chain, legit spend signed to Sepolia, the kill switch in action — [`docs/shearpin-demo-video.mp4`](docs/shearpin-demo-video.mp4).
 
 ---
 
